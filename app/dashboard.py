@@ -560,7 +560,7 @@ if active_view == "Max Pain / GEX":
     with st.expander("ℹ️ 怎么读"):
         st.write("期权卖方总赔付最小的行权价。到期前价格有向它靠拢的倾向, 越近到期越明显; 是倾向不是预测, 基本面消息会压过它。")
 
-    st.subheader(f"近似 GEX 剖面(BS 口径, {GEX_UNIT})")
+    st.subheader(f"近似 GEX 剖面(Cboe 厂商 gamma, {GEX_UNIT})")
     gex = metrics.gamma_exposure_profile(latest_df, selected_expiry)
     if years_left <= 0:
         st.info(f"这个到期日({format_date(selected_expiry)})在最新一班({format_datetime(latest_date)})已无剩余时间, gamma 按定义为零, 不是缺数据。")
@@ -582,7 +582,7 @@ if active_view == "Max Pain / GEX":
         )
     else:
         st.info("这个到期日没有可算 GEX 的数据。")
-    st.caption("Black-Scholes 用 Cboe 报价 IV 反算 gamma, 符号用「Call 记正、Put 记负」的朴素假设; 不是做市商真实头寸, 只是近似。")
+    st.caption("gamma 用 Cboe 厂商值(与晨刊同源; 缺失的合约才回落 Black-Scholes), 符号用「Call 记正、Put 记负」的朴素假设; 不是做市商真实头寸, 只是近似。")
     with st.expander("ℹ️ 怎么读"):
         st.write("总 gamma 为正 —— 市场偏「粘」, 对冲流抑制大幅波动; 为负 —— 对冲与趋势同向, 波动可能加速。按行权价看, 绝对值最大的几根常成为对冲流造出的支撑 / 阻力, 越近到期越明显。")
 
@@ -671,7 +671,7 @@ if active_view == "GEX 热图":
 
         with st.expander("ℹ️ 怎么读"):
             st.write(
-                f"每格是单一班里某行权价 × 某到期日的近似 GEX({GEX_UNIT}; Black-Scholes 用 Cboe 报价 IV 反算 gamma, 符号同「Max Pain / GEX」), "
+                f"每格是单一班里某行权价 × 某到期日的近似 GEX({GEX_UNIT}; gamma 用 Cboe 厂商值, 缺失才回落 Black-Scholes, 符号同「Max Pain / GEX」), "
                 "数字缩写(1.2k = 1,200, 1.5b = 15 亿)。绿 = 正(倾向抑制), 红 = 负(倾向放大), 近黑 = 接近零; 色阶按 90 分位定, "
                 "极值只涂到上限色, 数字仍照印。0 表示该到期日没挂这个行权价, 不是缺数据。\n\n"
                 "**Call 墙 / Put 墙** —— 在显示的到期日范围内, call / put 各自未平仓量最大的行权价(gammagrid 定义; 晨刊用的是 signed GEX 的极值档, "
@@ -906,8 +906,9 @@ st.markdown(
     "本页自己不向任何上游发请求; 时刻是 Cboe 给那份链盖的报价时刻, 已折成美东。GEX 正负号出自「Call 记正、Put 记负」的朴素做市商符号假设, "
     "未按持仓成本或逐笔成交方向校正, 可能与做市商真实净头寸有出入; 与 SpotGamma 等专业模型相比, 算法与数据源都不同, 量级仅供参考。</p>"
     f"<p>单位与纳入范围: 本页所有 GEX 读数的单位都是<b>{GEX_UNIT}</b>(gamma × 未平仓量 × 100 × 现价² × 0.01), B = 十亿美元、M = 百万美元, "
-    "与晨刊「盘前关键位」和静态 Gamma 页同一单位; 与「现价每变动 $1 的美元 gamma」差一个现价因子, 不可互换。gamma 由 Black-Scholes 用 Cboe 报价 IV 反算"
-    "(晨刊用 Cboe 厂商 gamma, 两者接近但不相等); 热图 / 状态句只看最近的若干到期日(各处写明), 晨刊纳入全部未到期到期日。"
+    "与晨刊「盘前关键位」和静态 Gamma 页同一单位; 与「现价每变动 $1 的美元 gamma」差一个现价因子, 不可互换。<b>gamma 用 Cboe 厂商值, 与晨刊 / "
+    "回看 / DIX 校准同源</b>(用户 2026-10-08 裁决; 只有 Cboe 没给 gamma 的合约才回落 Black-Scholes 用报价 IV 反算 —— 报价 IV 经 BS 在 0–1 DTE "
+    "上与厂商值系统性偏两侧, 会把 SPY / QQQ 的净值翻号); 热图 / 状态句只看最近的若干到期日(各处写明), 晨刊纳入全部未到期到期日。"
     "SPX 含 SPXW: 同到期日同行权价的两者在入库时合并(OI、成交量相加)。已到期合约不计。</p>"
     "<p>墙与翻转位: 本页「Call 墙 / Put 墙」= 各侧未平仓量最大的行权价, 「插值翻转价」= 离现价最近的累计 GEX 穿零点在相邻两档间线性插值出的价格; "
     "晨刊「Call 墙 / Put 墙」= signed GEX 的最大 / 最小档, 「累计穿零档」= 现价 ±15% 带内按行权价升序累加第一次由负转非负的<b>行权价</b>(不插值)。"

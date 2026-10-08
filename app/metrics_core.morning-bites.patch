@@ -1,0 +1,58 @@
+--- a/app/metrics_core.py
++++ b/app/metrics_core.py
+@@ -924,6 +924,26 @@
+         "implied_volatility", *_GREEK_KEYS,
+     ]
+     return table[columns].sort_values(["expiry", "strike", "option_type"]).reset_index(drop=True)
++
++
++def _provider_gamma_or(frame: pd.DataFrame, modelled) -> pd.Series:
++    """morning-bites patch (2026-10-08, option "b"): the provider's own gamma where it served one, Black-Scholes
++    only where it did not.
++
++    Cboe's greeks come from its full model (American exercise, dividends) and are the same numbers morning-bites'
++    own edition, levels_review and dix_calib read, so the two products agree on the sign. Measured on the 2026-10-08
++    premarket chains: Black-Scholes from the quoted IV sits systematically on both sides of the vendor's gamma
++    (OI-weighted Cboe/BS — SPY calls 1.22 / puts 0.89, QQQ 1.09 / 0.86, SPX 0.93 / 1.07), enough to flip the net
++    sign on SPY and QQQ. A chain without a provider gamma column (upstream fixtures, other providers) is unchanged.
++
++    `modelled` is the Black-Scholes gamma aligned row-for-row with `frame`; it stands wherever the provider column
++    is absent or NaN. A provider gamma of exactly 0 is kept — deep in or out of the money that is the honest value.
++    """
++    modelled = pd.Series(np.asarray(modelled, dtype=float), index=frame.index)
++    if "gamma" not in frame.columns:
++        return modelled
++    provided = pd.to_numeric(frame["gamma"], errors="coerce")
++    return provided.where(provided.notna(), modelled)
+ 
+ 
+ def _contract_gex(frame: pd.DataFrame, pricing: PricingInputs) -> pd.Series:
+@@ -964,7 +984,9 @@
+         pricing.rate_series(years), frame["option_type"],
+         dividend_yield=pricing.dividend_yield,
+     )
+-    contract_gex = greeks["gamma"] * pd.to_numeric(
++    # morning-bites patch: the provider's gamma first, Black-Scholes where the provider served none.
++    gamma = _provider_gamma_or(frame, greeks["gamma"])
++    contract_gex = gamma * pd.to_numeric(
+         frame["open_interest"], errors="coerce"
+     ).fillna(0) * 100 * spot
+     return contract_gex.where(frame["option_type"] != "put", -contract_gex)
+@@ -990,7 +1012,7 @@
+     spot = snapshot["underlying_price"].iloc[0]
+     years = years_to_expiry(expiry, snapshot_date)
+ 
+-    snapshot["gamma"] = snapshot.apply(
++    modelled = snapshot.apply(
+         lambda row: _black_scholes_greeks(
+             spot, row["strike"], years, row["implied_volatility"],
+             pricing.rate_for(years), row["option_type"],
+@@ -998,6 +1020,8 @@
+         )["gamma"],
+         axis=1,
+     )
++    # morning-bites patch: the provider's gamma first, Black-Scholes where the provider served none.
++    snapshot["gamma"] = _provider_gamma_or(snapshot, modelled)
+     snapshot["contract_gex"] = snapshot["gamma"] * snapshot["open_interest"].fillna(0) * 100 * spot
+     snapshot.loc[snapshot["option_type"] == "put", "contract_gex"] *= -1
+ 

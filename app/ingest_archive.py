@@ -100,6 +100,8 @@ def ingest(conn, out_root: Path, since_days: int | None = None) -> dict:
     counts = {"stored": 0, "present": 0, "empty": 0, "missing_raw": 0, "failed": 0}
     ok_name: str | None = None
     ok_at: dt.datetime | None = None
+    # 任一班失败后 ok 名就不再推进: 后面干净的一班不许把前面失败的那班盖过去, 否则 gammagrid_fresh 只抓得住最新一班的失败。
+    any_failed = False
     files = snapshot_files(out_root, since_days)
     for path in files:
         try:
@@ -107,6 +109,7 @@ def ingest(conn, out_root: Path, since_days: int | None = None) -> dict:
         except (OSError, ValueError) as exc:
             log.warning("跳过读不动的快照 %s: %s", path.name, exc)
             counts["failed"] += 1
+            any_failed = True
             continue
         date_str, session = snap["date"], snap["session"]
         session_date = dt.date.fromisoformat(date_str)
@@ -123,12 +126,13 @@ def ingest(conn, out_root: Path, since_days: int | None = None) -> dict:
             except Exception:  # noqa: BLE001 — 一份坏链不许拖垮回放
                 counts["failed"] += 1
                 clean = False
+                any_failed = True
                 log.error("%s %s 入库失败", path.stem, ticker, exc_info=True)
                 continue
             counts[outcome] += 1
             if outcome == "stored":
                 log.info("%s %s 入库", path.stem, ticker)
-        if clean:
+        if clean and not any_failed:
             ok_name, ok_at = path.stem, dt.datetime.now(dt.UTC)
     # 上游 worker 每个周期顺手做的三件库内维护, 这里跑完一轮各做一次(都是幂等 / 按日标记的)。
     worker.archive_if_due(conn)

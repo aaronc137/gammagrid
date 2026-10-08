@@ -13,6 +13,7 @@ Usage: python tests/unit_tests.py
 
 import datetime as dt
 import os
+import re
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -283,6 +284,48 @@ def check_screener_expiry_awareness():
     assert (table["dte"] == 7).all(), table["dte"].tolist()
     print("screener expiry-awareness checks passed")
 
+def _reverse_unified_diff(patch: str, new_text: str) -> str:
+    """Apply a single-file unified diff backwards: the `b/` side (`new_text`) back to the `a/` side.
+
+    Enough for the one small patch this fork carries — hunks in order, context lines required to match. Written
+    here rather than shelling out to `git apply --reverse`, so the check has the same answer with or without git.
+    """
+    hunk = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    new_lines = new_text.splitlines(keepends=True)
+    out: list[str] = []
+    pos = 0
+    lines = patch.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and not hunk.match(lines[i]):
+        i += 1                                      # ---/+++ headers and anything before the first hunk
+    while i < len(lines):
+        match = hunk.match(lines[i])
+        assert match, f"unexpected line in patch: {lines[i]!r}"
+        new_start = int(match.group(3)) - 1
+        i += 1
+        old_side: list[str] = []
+        new_side: list[str] = []
+        while i < len(lines) and not hunk.match(lines[i]):
+            tag, text = lines[i][0], lines[i][1:]
+            if tag == " ":
+                old_side.append(text)
+                new_side.append(text)
+            elif tag == "-":
+                old_side.append(text)
+            elif tag == "+":
+                new_side.append(text)
+            elif tag != "\\":                        # "\ No newline at end of file"
+                raise AssertionError(f"unexpected line in patch: {lines[i]!r}")
+            i += 1
+        assert new_lines[new_start:new_start + len(new_side)] == new_side, \
+            f"patch hunk at +{new_start + 1} does not match app/metrics_core.py"
+        out.extend(new_lines[pos:new_start])
+        out.extend(old_side)
+        pos = new_start + len(new_side)
+    out.extend(new_lines[pos:])
+    return "".join(out)
+
+
 def check_metrics_core_is_pristine():
     """app/metrics_core.py is byte-identical to the copy in the hosted product's
     repository. This check is what makes that claim enforceable here.
@@ -309,10 +352,22 @@ def check_metrics_core_is_pristine():
         recorded = handle.read().split()[0]
     assert actual == recorded, (
         "app/metrics_core.py changed but app/metrics_core.sha256 did not.\n"
-        "  This file is shared with the hosted product. If the change is\n"
-        "  deliberate, it has to land there too — then write this line into\n"
+        "  morning-bites fork: the core may differ from upstream ONLY by app/metrics_core.morning-bites.patch.\n"
+        "  If the change is deliberate, regenerate that patch against the upstream copy and write this line into\n"
         "  app/metrics_core.sha256:\n"
         f"    {actual}  app/metrics_core.py"
+    )
+    # morning-bites fork (2026-10-08, option b): the core carries one recorded patch (provider gamma first, see
+    # metrics_core._provider_gamma_or). Reverse-applying that patch must give back the upstream file byte for byte,
+    # so an upstream merge that touches those hunks fails here instead of silently drifting.
+    with open(os.path.join(root, "app", "metrics_core.upstream.sha256")) as handle:
+        upstream = handle.read().split()[0]
+    with open(os.path.join(root, "app", "metrics_core.morning-bites.patch"), encoding="utf-8") as handle:
+        patch = handle.read()
+    reverted = _reverse_unified_diff(patch, body.decode())
+    assert hashlib.sha256(reverted.encode()).hexdigest() == upstream, (
+        "app/metrics_core.py differs from upstream by more than app/metrics_core.morning-bites.patch — "
+        "regenerate the patch (diff -u upstream fork) or revert the extra change"
     )
 
     source = body.decode()
@@ -678,9 +733,50 @@ def check_cboe_archive_adapter_and_ingest():
             again = ingest_archive.ingest(conn, out)
             assert again["stored"] == 0 and again["present"] == 1, again
             assert len(db.get_snapshots_at(conn, "SPX", [at], source="cboe")) == 3
+            # 任一班失败后 ok 名不再推进: 更早一班的 raw 坏了, 后面干净的一班照入库, 但 ingest.ok 不许越过失败的那班。
+            (out / "gex" / "2026-09-29-close.json").write_text(json.dumps(
+                {"date": "2026-09-29", "session": "close", "reads": [{"ticker": "SPX"}]}))
+            (out / "gex" / "raw" / "2026-09-29-close-_SPX.json.gz").write_bytes(b"not a gzip file")
+            later = dict(payload, timestamp="2026-10-01 12:59:20")
+            (out / "gex" / "2026-10-01-premarket.json").write_text(json.dumps(
+                {"date": "2026-10-01", "session": "premarket", "reads": [{"ticker": "SPX"}]}))
+            (out / "gex" / "raw" / "2026-10-01-premarket-_SPX.json.gz").write_bytes(gzip.compress(json.dumps(later).encode()))
+            third = ingest_archive.ingest(conn, out)
+            assert third["failed"] == 1 and third["stored"] == 1 and third["ingest_ok"] is None, third
+            assert (out / "gammagrid" / "ingest.ok").read_text().splitlines()[0] == "2026-09-30-premarket", \
+                "a clean later snapshot must not advance ingest.ok past a failed earlier one"
         finally:
             conn.close()
-    print("cboe archive adapter + ingest checks passed (merge, expiry, zero IV, idempotent)")
+    print("cboe archive adapter + ingest checks passed (merge, expiry, zero IV, idempotent, ok-name halts on failure)")
+
+
+def check_vendor_gamma_first_then_black_scholes():
+    """morning-bites (b): GEX 用 Cboe 厂商 gamma, 只有缺失(NaN)的合约回落 Black-Scholes; 没有 gamma 列的链整条走 BS。"""
+    from app import metrics_core
+
+    at = pd.Timestamp("2026-10-08 13:00:00")
+    expiry = pd.Timestamp("2026-10-16")
+    base = {"collected_at": at, "underlying_price": 100.0, "expiry": expiry, "implied_volatility": 0.25, "open_interest": 10}
+    chain = pd.DataFrame([
+        {**base, "strike": 100.0, "option_type": "call", "gamma": 0.05},
+        {**base, "strike": 100.0, "option_type": "put", "gamma": np.nan},
+        {**base, "strike": 90.0, "option_type": "put", "gamma": 0.0},
+    ])
+    years = metrics.years_to_expiry(expiry, at)
+    bs_put = metrics._black_scholes_greeks(
+        100.0, 100.0, years, 0.25, metrics.DEFAULT_PRICING.rate_for(years), "put",
+        dividend_yield=metrics.DEFAULT_PRICING.dividend_yield,
+    )["gamma"]
+    gex = metrics_core._contract_gex(chain, metrics.DEFAULT_PRICING)
+    assert abs(gex.iloc[0] - 0.05 * 10 * 100 * 100.0) < 1e-9, "the vendor's gamma wins where it served one"
+    assert abs(gex.iloc[1] - (-bs_put * 10 * 100 * 100.0)) < 1e-9, "a NaN vendor gamma falls back to Black-Scholes"
+    assert gex.iloc[2] == 0.0, "a vendor gamma of exactly 0 is kept, not modelled over"
+    profile = metrics.gamma_exposure_profile(chain, expiry)
+    by_strike = dict(zip(profile["strike"], profile["gex"]))
+    assert abs(by_strike[100.0] - (gex.iloc[0] + gex.iloc[1])) < 1e-6 and by_strike[90.0] == 0.0, by_strike
+    bare = metrics_core._contract_gex(chain.drop(columns=["gamma"]), metrics.DEFAULT_PRICING)
+    assert abs(bare.iloc[1] - gex.iloc[1]) < 1e-9 and abs(bare.iloc[0] - gex.iloc[0]) > 1e-6, "no gamma column: all Black-Scholes"
+    print("vendor-gamma-first checks passed (Cboe gamma, Black-Scholes only where it is missing)")
 
 
 def check_provider_registry():
@@ -2076,6 +2172,7 @@ def main():
     check_screener_expiry_awareness()
     check_provider_registry()
     check_cboe_archive_adapter_and_ingest()
+    check_vendor_gamma_first_then_black_scholes()
     check_metrics_core_is_pristine()
     check_dividend_yield_defaults_to_the_old_model()
     check_iv_average_survives_a_contract_without_iv()

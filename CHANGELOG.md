@@ -12,7 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reads `out/gex/raw/*.json.gz`; `app/ingest_archive.py` ingests every snapshot the archive has (idempotent on
   `(ticker, 'cboe', Cboe quote timestamp)`), drops expired series, merges SPX/SPXW, stamps `iv_model='provider'`.
   Yahoo provider, the symbol catalogue and the TradingView embed are removed: the page makes no outside request.
-- **Implied volatility is the Cboe quote IV** (`app/metrics.py` passes `with_solved_iv` through); `metrics_core.py` untouched.
+- **Implied volatility is the Cboe quote IV** (`app/metrics.py` passes `with_solved_iv` through).
+- **GEX uses Cboe's vendor gamma, Black-Scholes only where Cboe served none** (`metrics_core._provider_gamma_or`, used by
+  `_contract_gex` and `gamma_exposure_profile`). Decided 2026-10-08 after measuring the 10-08 premarket chains: BS from
+  the quoted IV sits on both sides of the vendor gamma (OI-weighted Cboe/BS SPY calls 1.22 / puts 0.89, QQQ 1.09 / 0.86,
+  SPX 0.93 / 1.07), enough to flip the net sign on SPY and QQQ against the morning edition, which reads the vendor value.
+  `metrics_core.py` therefore differs from upstream by exactly `app/metrics_core.morning-bites.patch`; the pristine check
+  pins the fork's hash and that the patch reverse-applies to upstream's. Ingest no longer advances `ingest.ok` past a
+  failed snapshot.
 - **GEX is shown per 1 % of spot** (× spot × 0.01 at display only; the database keeps per-$1), every figure labelled;
   a header strip shows morning-bites' own levels (`gex_calc`) side by side, with both definitions spelled out.
 - Chinese UI, morning-bites dark palette, times always America/New_York, Access-header gate, AGPL source link in the sidebar.

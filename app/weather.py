@@ -127,7 +127,7 @@ def panel(reading: dict, latest_moment=None) -> str:
         f'<svg width="44" height="44" viewBox="0 0 44 44" aria-hidden="true">{art}</svg>'
         '<div class="gg-weather-words">'
         f'<div class="gg-weather-label">{words["label"]}'
-        f'<span class="gg-weather-scope"> · gammagrid 口径 · BS gamma{scope}{stale}</span></div>'
+        f'<span class="gg-weather-scope"> · gammagrid 口径 · Cboe 厂商 gamma{scope}{stale}</span></div>'
         f'<div class="gg-weather-sentence">{words["sentence"]}</div>'
         "</div>"
         f'<dl class="gg-levels">{"".join(levels)}</dl>'

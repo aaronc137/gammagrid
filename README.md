@@ -1,8 +1,11 @@
 > **This is the [morning-bites](https://github.com/aaronc137/morning-bites) fork of GammaGrid** (branch `morning-bites`,
 > based on upstream v0.7.0 @ aefe0f4). It replays morning-bites' own Cboe option-chain archive instead of collecting
-> from Yahoo, shows GEX per 1 % of spot, speaks Chinese and runs behind Cloudflare Access at `/gamma/` on the
-> morning-bites site. What changed and why: `CHANGELOG.md` → *Unreleased → morning-bites fork*, and the module
-> docstrings of `app/providers/cboe_archive.py`, `app/ingest_archive.py`, `app/dashboard.py`. Deployment: `deploy/`.
+> from Yahoo, shows GEX per 1 % of spot, **uses Cboe's own (vendor) gamma for GEX** — the same numbers the morning
+> edition reads — falling back to Black-Scholes only for contracts Cboe served no gamma for, speaks Chinese and runs
+> behind Cloudflare Access at `/gamma/` on the morning-bites site. `app/metrics_core.py` differs from upstream by
+> exactly the hunks in `app/metrics_core.morning-bites.patch` (the pristine check pins both). What changed and why:
+> `CHANGELOG.md` → *Unreleased → morning-bites fork*, and the module docstrings of `app/providers/cboe_archive.py`,
+> `app/ingest_archive.py`, `app/dashboard.py`. Deployment: `deploy/`.
 > Licence unchanged: AGPL-3.0 — the running copy links to the exact commit it was built from (sidebar footer).
 > Everything below is the upstream README.
 
