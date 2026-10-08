@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, morning-bites]
   pull_request:
 
 jobs:

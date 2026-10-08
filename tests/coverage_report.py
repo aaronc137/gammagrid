@@ -41,15 +41,11 @@ MEASURED_MODULES = (
     "app/metrics_core.py",
     "app/collector.py",
     "app/providers/base.py",
-    "app/providers/yahoo.py",
+    "app/providers/cboe_archive.py",
     "app/providers/__init__.py",
     # What to say to somebody whose ticker will never work. Pure functions with
     # no dependencies, and the entire experience of getting a symbol wrong.
     "app/suggestions.py",
-    # The symbol directory behind the Add-ticker search box. Measured because a
-    # catalogue that quietly fails to load looks exactly like an empty one, and
-    # the box degrades so gracefully that nobody would notice.
-    "app/catalogue.py",
     # The one number this product stores rather than solves as it draws, and the
     # background task that brings it onto our own model. Measured because a
     # backfill that quietly does nothing looks exactly like a backfill that has
@@ -69,16 +65,6 @@ SUITES = ("tests.unit_tests", "tests.smoke_test")
 EXEMPT = {
     "collector.fetch_ticker_snapshot": "network: delegates to the active provider",
     "collector.fetch_price_history": "network: delegates to the active provider",
-    # Everything that actually touches Yahoo. Exempt by name rather than by
-    # module so that a NEW function in app/providers/ still has to be either
-    # tested or consciously listed here.
-    "yahoo.YahooProvider.fetch_ticker_snapshot": "network: Yahoo",
-    "yahoo.YahooProvider.fetch_price_history": "network: Yahoo",
-    "yahoo.YahooProvider.fetch_underlying_price": "network: Yahoo",
-    "yahoo.YahooProvider._fetch_underlying_price": "network: Yahoo",
-    "yahoo.YahooProvider._fetch_chain_for_expiry": "network: Yahoo",
-    "yahoo.YahooProvider.check_access": "network: Yahoo",
-    "yahoo.YahooProvider.underlying_has_options": "network: Yahoo",
     # The Protocol is a declaration of the shape real providers implement, and
     # calling one of its methods executes nothing at all. A test for these would
     # assert that `...` returns None.
@@ -87,10 +73,12 @@ EXEMPT = {
     "base.DataProvider.check_access": "Protocol declaration, empty body",
     "base.with_retry": "retries a network call; only reachable through the ones above",
     "db.get_connection": "used by every check; not a behaviour to assert",
-    # The one outbound call that is not to the data source. Its parse is checked
-    # against the real header, which is the half that actually breaks; the
-    # download around it is urllib and a User-Agent.
-    "catalogue.fetch_directory": "network: downloads the directory from Cboe",
+    # morning-bites: 本 fork 的 app/metrics.py 把 with_solved_iv 直通 Cboe 报价 IV, 核心里的反解一路不再有人走;
+    # metrics_core.py 要与上游逐字节相同(check_metrics_core_is_pristine), 所以不删、只豁免。
+    "metrics_core.with_solved_iv": "morning-bites: bypassed (Cboe quote IV), core kept byte-identical",
+    "metrics_core.solve_implied_volatility": "morning-bites: bypassed (Cboe quote IV), core kept byte-identical",
+    "metrics_core.contract_price_for_iv": "morning-bites: bypassed (Cboe quote IV), core kept byte-identical",
+    "metrics_core._bs_price": "morning-bites: bypassed (Cboe quote IV), core kept byte-identical",
 }
 
 COVERAGE_FLOOR = 100.0  # percent, excluding EXEMPT

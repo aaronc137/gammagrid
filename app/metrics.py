@@ -44,6 +44,7 @@ from app.metrics_core import (
     _is_priceable,
     _last_snapshot_per_day,
     _mark_unreliable_iv,
+    _unsolved,
     contract_greeks_history,
     contract_price_for_iv,
     contracts_backing_expiry,
@@ -73,11 +74,23 @@ from app.metrics_core import (
     solve_implied_volatility,
     unusual_activity,
     volume_stats,
-    with_solved_iv,
     years_to_expiry,
     years_to_expiry_by_moment,
     years_to_expiry_series,
 )
+
+# --- morning-bites: IV 用 Cboe 报价 IV, 不从 last_trade_price 反解 ------------
+# 上游的 with_solved_iv 是为 Yahoo 写的(那边 IV 有洞、与报价对不上); Cboe 的 iv 列本来就是报价 IV,
+# 而 last_trade_price 在盘前 / 冷门档是陈旧成交价, 反解只会出垃圾。这里直通: 两个标记列照加,
+# `implied_volatility` 原样。metrics_core.py 一个字节不动(sha256 检查仍成立), 上游合并零冲突。
+# 覆盖在这一层而不是各调用方: dashboard.with_our_iv、day_summary.build_row、iv_backfill 都经 app.metrics 拿它。
+
+
+def with_solved_iv(snapshot, pricing: PricingInputs = DEFAULT_PRICING, ticker: str | None = None):
+    if snapshot is None or snapshot.empty:
+        return snapshot
+    return _unsolved(snapshot)
+
 
 # --- gamma weather -----------------------------------------------------------
 # The five states a daily summary can be in. Names, not icons: which picture a

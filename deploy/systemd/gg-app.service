@@ -1,0 +1,20 @@
+# 晨读 · Gamma(morning-bites 定制版 gammagrid)常驻页面。装法见 deploy/install.sh。
+# 地址 / 端口 / baseUrlPath 在 .streamlit/config.toml(127.0.0.1:8903 /gamma); 公网经 cloudflared 隧道 + Access。
+[Unit]
+Description=gammagrid app (morning-bites fork) on 127.0.0.1:8903/gamma
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gammagrid
+EnvironmentFile=%h/.config/gammagrid/env
+Environment=PYTHONPATH=%h/gammagrid
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/gammagrid/.venv/bin/streamlit run app/dashboard.py
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/gammagrid/out/app.log
+StandardError=append:%h/gammagrid/out/app.log
+
+[Install]
+WantedBy=default.target

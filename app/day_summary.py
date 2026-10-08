@@ -277,7 +277,7 @@ def changes(
     # Weather: a word, coloured by which way the regime moved.
     before_state, after_state = prev.get("state"), current.get("state")
     state = {
-        "key": "state", "label": "Gamma weather", "before": before_state, "after": after_state,
+        "key": "state", "label": "Gamma 状态", "before": before_state, "after": after_state,
         "unit": "state", "delta": None, "delta_pct": None, "strikes": None, "kind": UNKNOWN,
     }
     if before_state is not None and after_state is not None:
@@ -286,24 +286,28 @@ def changes(
     lines.append(state)
 
     lines.append(_number_change(
-        "price", "Price", prev.get("underlying_price"), current.get("underlying_price"), unit="price",
+        "price", "现价", prev.get("underlying_price"), current.get("underlying_price"), unit="price",
     ))
 
-    net = _number_change("net_gex", "Net GEX", prev.get("net_gex"), current.get("net_gex"), unit="gex")
+    # morning-bites: 库里是每 $1, 两边各按自己那天的现价换成每 1% 再比(单位见页面脚注)。
+    net = _number_change(
+        "net_gex", "净 GEX · 每 1%", weather.per_pct(prev.get("net_gex"), prev.get("underlying_price")),
+        weather.per_pct(current.get("net_gex"), current.get("underlying_price")), unit="gex",
+    )
     if net["kind"] == MOVED and (net["before"] < 0) != (net["after"] < 0):
         net["kind"] = DAMPING if net["after"] >= 0 else AMPLIFYING
     lines.append(net)
 
     lines.append(_number_change(
-        "call_wall", "Call wall", prev.get("call_wall"), current.get("call_wall"),
+        "call_wall", "Call 墙 · OI", prev.get("call_wall"), current.get("call_wall"),
         unit="strikes", step=step,
     ))
     lines.append(_number_change(
-        "put_wall", "Put wall", prev.get("put_wall"), current.get("put_wall"),
+        "put_wall", "Put 墙 · OI", prev.get("put_wall"), current.get("put_wall"),
         unit="strikes", step=step,
     ))
     lines.append(_number_change(
-        "gamma_flip", "Gamma flip", prev.get("gamma_flip"), current.get("gamma_flip"), unit="price",
+        "gamma_flip", "插值翻转价", prev.get("gamma_flip"), current.get("gamma_flip"), unit="price",
     ))
 
     # Max pain: comparable only for the same expiry, so a nearest expiry that
@@ -315,17 +319,17 @@ def changes(
     else:
         pain_before = previous_same_expiry_pain
     pain = _number_change(
-        "max_pain", f"Max pain · {c_exp}" if c_exp else "Max pain",
+        "max_pain", f"Max Pain · {c_exp}" if c_exp else "Max Pain",
         pain_before, current.get("nearest_max_pain"), unit="strikes", step=step,
     )
     if previous and p_exp is not None and not same_expiry:
         if pain_before is None:
             pain["kind"] = NEW if c_exp is not None else GONE
-        pain["note"] = f"nearest expiry was {p_exp}"
+        pain["note"] = f"此前最近到期日是 {p_exp}"
     lines.append(pain)
 
     move = {
-        "key": "expected_move", "label": f"Expected move · {c_exp}" if c_exp else "Expected move",
+        "key": "expected_move", "label": f"预期波幅(1σ)· {c_exp}" if c_exp else "预期波幅(1σ)",
         "before": _band(prev) if same_expiry else None, "after": _band(current), "unit": "band",
         "delta": None, "delta_pct": None, "strikes": None, "kind": UNKNOWN,
     }
@@ -337,24 +341,24 @@ def changes(
     lines.append(move)
 
     lines.append(_number_change(
-        "pcr_volume", "Put/Call · volume",
+        "pcr_volume", "Put/Call · 成交量",
         _ratio(p_roll.get("put_volume"), p_roll.get("call_volume")),
         _ratio(c_roll.get("put_volume"), c_roll.get("call_volume")), unit="ratio",
     ))
     lines.append(_number_change(
-        "pcr_oi", "Put/Call · open interest",
+        "pcr_oi", "Put/Call · 未平仓量",
         _ratio(p_roll.get("put_oi"), p_roll.get("call_oi")),
         _ratio(c_roll.get("put_oi"), c_roll.get("call_oi")), unit="ratio",
     ))
     lines.append(_number_change(
-        "iv", "IV · volume-weighted",
+        "iv", "IV · 成交量加权",
         p_roll.get("iv_weighted_avg"), c_roll.get("iv_weighted_avg"), unit="pts",
     ))
     lines.append(_number_change(
-        "call_oi", "Open interest · calls", p_roll.get("call_oi"), c_roll.get("call_oi"), unit="pct",
+        "call_oi", "未平仓量 · call", p_roll.get("call_oi"), c_roll.get("call_oi"), unit="pct",
     ))
     lines.append(_number_change(
-        "put_oi", "Open interest · puts", p_roll.get("put_oi"), c_roll.get("put_oi"), unit="pct",
+        "put_oi", "未平仓量 · put", p_roll.get("put_oi"), c_roll.get("put_oi"), unit="pct",
     ))
 
     # The chain's shape: expiries that rolled off and ones newly listed, named
@@ -362,14 +366,14 @@ def changes(
     before_list = list(prev.get("expiries") or [])
     after_list = list(current.get("expiries") or [])
     shape = _number_change(
-        "expiries", "Expiries listed",
+        "expiries", "挂牌到期日数",
         len(before_list) if previous else None, len(after_list), unit="count",
     )
     shape["rolled_off"] = [e for e in before_list if e not in after_list]
     shape["listed"] = [e for e in after_list if e not in before_list]
     lines.append(shape)
     lines.append(_number_change(
-        "contracts", "Contracts in the chain", prev.get("contracts"), current.get("contracts"), unit="count",
+        "contracts", "链上合约数", prev.get("contracts"), current.get("contracts"), unit="count",
     ))
 
     if previous is None:
@@ -394,27 +398,25 @@ def headline(lines: list[dict]) -> str:
     by_key = {line["key"]: line for line in lines}
     state = by_key["state"]
     if state["kind"] in (DAMPING, AMPLIFYING):
-        return f"Gamma weather turned from {_word(state['before'])} to {_word(state['after'])}."
+        return f"Gamma 状态从「{_word(state['before'])}」转为「{_word(state['after'])}」。"
     net = by_key["net_gex"]
     if net["kind"] in (DAMPING, AMPLIFYING):
-        return "Net gamma changed sign: dealer hedging now " + (
-            "damps moves." if net["kind"] == DAMPING else "amplifies moves."
-        )
+        return "净 gamma 变号: 对冲流现在" + ("倾向抑制波动。" if net["kind"] == DAMPING else "倾向放大波动。")
     moved = [
-        line["label"].split(" · ")[0].lower()
+        line["label"].split(" · ")[0]
         for line in lines
         if line["key"] in ("call_wall", "put_wall", "max_pain") and line["kind"] == MOVED
     ]
     if moved:
-        return "Levels moved: " + ", ".join(moved) + "."
+        return "位置挪了: " + "、".join(moved) + "。"
     if state["kind"] == SAME:
-        return f"Same weather as the day before ({_word(state['after'])}); the levels held."
-    return "First day on record — nothing to compare yet."
+        return f"状态与前一天相同({_word(state['after'])}), 位置没动。"
+    return "第一天, 还没有可比的。"
 
 
 def _word(state: str | None) -> str:
     words = weather.WEATHER_WORDS
-    return words[state][0].lower() if state in words else str(state)
+    return words[state][0] if state in words else str(state)
 
 
 # --- how a line is read out -----------------------------------------------
@@ -463,13 +465,13 @@ def format_delta(line: dict) -> str:
     if kind == UNKNOWN:
         return "—"
     if kind == GONE:
-        return "gone"
+        return "没了"
     if kind == NEW:
-        return "new"
+        return "新"
     if kind == SAME:
-        return "unchanged"
+        return "未变"
     if unit == "state":
-        return "amplifying" if kind == AMPLIFYING else "damping"
+        return "转向放大" if kind == AMPLIFYING else "转向抑制"
     delta = line.get("delta")
     if delta is None:
         return ""
@@ -478,7 +480,7 @@ def format_delta(line: dict) -> str:
     # moved in the fourth decimal reads "+0.00" next to two identical numbers,
     # which asks the reader to find a difference that is not there.
     if _is_zero(printed):
-        return "unchanged"
+        return "未变"
     return printed
 
 
@@ -490,14 +492,13 @@ def _printed_delta(line: dict, delta: float, unit: str) -> str:
     if unit == "gex":
         return weather.format_gex(delta)
     if unit == "pts":
-        return f"{delta * 100:+.1f} pts"
+        return f"{delta * 100:+.1f} 个百分点"
     if unit == "strikes" and line.get("strikes") is not None:
         strikes = line["strikes"]
         whole = int(strikes) if float(strikes).is_integer() else strikes
-        plural = "" if abs(float(strikes)) == 1 else "s"
-        return f"{whole:+g} strike{plural} · {delta:+,.2f}"
+        return f"{whole:+g} 档 · {delta:+,.2f}"
     if unit == "band":
-        return f"{delta:+,.2f} wide"
+        return f"宽度 {delta:+,.2f}"
     if unit in ("count",):
         return f"{int(delta):+,}"
     if unit == "pct" and line.get("delta_pct") is not None:

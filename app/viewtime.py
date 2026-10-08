@@ -21,7 +21,6 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 
 def viewer_timezone():
@@ -38,16 +37,8 @@ def viewer_timezone():
     17.08 — `st.context.timezone` is None there rather than raising, so the
     fallback is a value, not an exception handler.
     """
-    try:
-        name = st.context.timezone
-    except Exception:  # noqa: BLE001 — no browser, no context, no timezone
-        name = None
-    if not name:
-        return dt.timezone.utc
-    try:
-        return ZoneInfo(name)
-    except Exception:  # noqa: BLE001 — a browser is free to send nonsense
-        return dt.timezone.utc
+    # morning-bites: 全站只说美东, 不跟读者浏览器走(上游按 st.context.timezone 显示读者本地时间)。
+    return ZoneInfo("America/New_York")
 
 
 def _as_aware(value) -> pd.Timestamp:

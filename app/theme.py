@@ -1,95 +1,70 @@
-"""The design tokens, and the few components Streamlit has no shape for.
+"""配色与 Streamlit 画不出来的几个组件 —— morning-bites 定制版。
 
-WHY THIS FILE EXISTS AT ALL. Most of the look is `.streamlit/config.toml`,
-which Streamlit applies to every widget it draws. What it cannot express is a
-composed piece — the summary panel above the views, with an eyebrow line, a
-sentence and a row of levels — so those are written here as small pieces of
-HTML against the same tokens, rather than as ad-hoc colours at the call site.
+颜色是 morning-bites `templates/_theme_head.html.j2` 的暗色 token(2026-09-08 那组, 实施时现场抄, 不凭记忆):
+paper #0F1114 · panel #161A1F · ink #E6E4DC · body #C4C2BA · muted #AAA9A2 · graphite #93938D · faint #5C5D59 ·
+rule #2C3138 · wash #272C32 · up #3DBA7A · dn #F26B5E · seal #F0863A。
+GEX 正负色按 morning-bites ADR 2026-09-07: 正(抑制)= --up 绿, 负(放大)= --dn 红; 上游的紫 / 绿语义照搬, 只换色值。
+类名 gg-green / gg-purple 保留(上游模板与「较昨日」视图都用), 紫现在是红。
 
-THE TOKENS ARE THE HOSTED PRODUCT'S. Two products with one name should not be
-readable as two tools, so the values below are the ones app.gammagrid.io uses
-in its own stylesheet: the same palette, the same three radii, the same type
-scale of four sizes plus a hero size for a number that IS the content of its
-tile. Changing one of them here without changing it there is how two products
-start looking like two products.
-
-WHY VALUES AND NOT A STYLESHEET FILE. Streamlit has no static asset path that
-survives a container rebuild without extra plumbing, and the total is under a
-hundred lines. Constants also mean a call site can use a colour in a Plotly
-figure and in CSS and get the same one.
+Modified for morning-bites, 2026-10-08. AGPL-3.0, 同本仓 LICENSE。
 """
 
 from __future__ import annotations
 
 # --- palette ---------------------------------------------------------------
-# The brand pair carries meaning everywhere in this product: green is damping,
-# purple is amplification. Nothing else may be drawn in them.
-PRIMARY = "#B833E0"
-PRIMARY_SOFT = "#DA8EF2"
-ACCENT = "#22C55E"
-ACCENT_SOFT = "#6EDE9A"
+PRIMARY = "#F26B5E"        # 放大 / 负 GEX(--dn)
+PRIMARY_SOFT = "#F26B5E"
+ACCENT = "#3DBA7A"         # 抑制 / 正 GEX(--up)
+ACCENT_SOFT = "#3DBA7A"
 
-BACKGROUND = "#0A0C0B"
-SURFACE = "#111614"
-# A third level, for something raised above its own panel — a sticky table
-# header, a tile inside a card. Never a second page background.
-SURFACE_2 = "#182220"
-BORDER = "#2A332E"
-GRID = "#1C2320"
+BACKGROUND = "#0F1114"     # --paper
+SURFACE = "#161A1F"        # --panel
+SURFACE_2 = "#272C32"      # --wash
+BORDER = "#2C3138"         # --rule
+GRID = "#2C3138"
 
-TEXT = "#EDEFEC"
-MUTED = "#96A39B"
-FAINT = "#5C6A62"
+TEXT = "#E6E4DC"           # --ink
+MUTED = "#AAA9A2"          # --muted
+FAINT = "#93938D"          # --graphite(--faint #5C5D59 在 10px 小字上过不了 4.5:1, 见 morning-bites 那段注释)
 
-ERROR = "#F08080"
-WARNING = "#E8C46A"
+ERROR = "#F26B5E"
+WARNING = "#F0863A"        # --seal
 
 # --- shape -----------------------------------------------------------------
-RADIUS_PANEL = "8px"
-RADIUS_BOX = "6px"
-RADIUS_CONTROL = "4px"
-SHADOW_PANEL = "0 6px 18px rgba(0, 0, 0, 0.28)"
+RADIUS_PANEL = "4px"
+RADIUS_BOX = "4px"
+RADIUS_CONTROL = "3px"
+SHADOW_PANEL = "none"
 
 # --- type ------------------------------------------------------------------
-TEXT_MICRO = "11px"   # an eyebrow label, an uppercase meta line
-TEXT_BASE = "13px"    # the working size
-TEXT_LEAD = "16px"    # a word meant to stand out a little
-TEXT_STRONG = "18px"  # a view's heading; a number above body weight
-TEXT_HERO = "28px"    # a number that is the point of the tile it sits in
+TEXT_MICRO = "11px"
+TEXT_BASE = "13px"
+TEXT_LEAD = "16px"
+TEXT_STRONG = "18px"
+TEXT_HERO = "28px"
 
+# morning-bites 的 --sans / --mono 字体栈, 无 webfont 下载。
 FONT_UI = (
-    "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, "
-    "'Helvetica Neue', Arial, sans-serif"
+    "-apple-system, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', "
+    "'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif"
 )
-FONT_MONO = "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace"
+FONT_MONO = (
+    "ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'PingFang SC', "
+    "'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', monospace"
+)
 
 
 def stylesheet() -> str:
-    """The one <style> block the page injects, in tokens rather than literals.
-
-    KEPT DELIBERATELY SHORT. Every rule here is one Streamlit does not have a
-    setting for; anything that can be said in config.toml is said there
-    instead, because a theme setting survives a Streamlit upgrade and a
-    selector into its DOM does not.
-    """
     return f"""
 <style>
-  /* Headings follow the chrome, not the data: Streamlit's own heading font
-     setting does not reach the h2/h3 a view writes through st.subheader. */
   h1, h2, h3, h4, [data-testid="stHeading"] {{
     font-family: {FONT_UI} !important;
     letter-spacing: 0.01em;
   }}
-
-  /* The view switcher reads as a row of pills, the shape the hosted product
-     uses: a capsule per view, the active one picked out in the brand purple. */
   [data-testid="stSegmentedControl"] button {{
     border-radius: 999px !important;
     padding: 4px 14px !important;
   }}
-
-  /* Numbers read as numbers. Tabular figures line up in a column and stop a
-     price from jittering as it changes, which a proportional face does. */
   [data-testid="stMetricValue"],
   [data-testid="stDataFrame"],
   .gg-mono {{
@@ -97,8 +72,8 @@ def stylesheet() -> str:
     font-variant-numeric: tabular-nums;
   }}
 
-  /* The summary panel above the views. */
-  .gg-weather {{
+  /* 状态句面板与晨刊口径条: 同一形状, 一个带图标一个不带。 */
+  .gg-weather, .gg-mb {{
     display: flex;
     align-items: center;
     gap: 18px;
@@ -106,12 +81,12 @@ def stylesheet() -> str:
     border: 1px solid {BORDER};
     border-radius: {RADIUS_PANEL};
     background: {SURFACE};
-    box-shadow: {SHADOW_PANEL};
     padding: 14px 18px;
     margin-bottom: 0.6rem;
   }}
-  .gg-weather-words {{ flex: 1 1 260px; min-width: 0; }}
-  .gg-weather-label {{
+  .gg-mb {{ border-style: dashed; }}
+  .gg-weather-words, .gg-mb-words {{ flex: 1 1 260px; min-width: 0; }}
+  .gg-weather-label, .gg-mb-label {{
     font-size: {TEXT_LEAD};
     font-weight: 700;
     color: {TEXT};
@@ -152,24 +127,6 @@ def stylesheet() -> str:
   .gg-green {{ color: {ACCENT_SOFT}; }}
   .gg-purple {{ color: {PRIMARY_SOFT}; }}
 
-  /* The status line beside the ticker: a dot, then when this screen is from. */
-  .gg-status {{
-    color: {MUTED};
-    font-size: {TEXT_BASE};
-    text-align: right;
-    padding-top: 6px;
-  }}
-  .gg-status b {{ color: {TEXT}; font-weight: 600; }}
-  .gg-dot {{
-    display: inline-block;
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    margin-right: 7px;
-    vertical-align: middle;
-  }}
-
-  /* The ladder of changes: a table, but not a dataframe — the chips carry
-     meaning in colour and a grid of cells would bury that. */
   .gg-ladder {{
     width: 100%;
     border-collapse: collapse;
@@ -203,5 +160,17 @@ def stylesheet() -> str:
     color: {FAINT};
     font-size: {TEXT_MICRO};
   }}
+
+  /* 页脚口径四段(措辞搬自 morning-bites board_gex.html.j2)。 */
+  .gg-foot {{
+    margin-top: 2rem;
+    padding-top: 0.8rem;
+    border-top: 1px solid {BORDER};
+    color: {MUTED};
+    font-size: {TEXT_MICRO};
+    line-height: 1.6;
+  }}
+  .gg-foot p {{ margin: 0 0 0.5rem; }}
+  .gg-foot b {{ color: {TEXT}; font-weight: 600; }}
 </style>
 """

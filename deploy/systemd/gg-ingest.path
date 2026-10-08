@@ -1,0 +1,11 @@
+# 盯 out/gex 目录(不是 raw/): 三份 raw 先落、快照 json 最后落, 快照出现 = 三份 raw 齐了。
+# 快照是 .tmp + os.replace, 会触发两次; 单元运行中丢掉的事件由「全量扫 + 幂等」兜住, 入库起手 sleep 5s 等文件落稳。
+[Unit]
+Description=watch morning-bites out/gex for new option-chain snapshots
+
+[Path]
+PathChanged=%h/morning-bites/out/gex
+Unit=gg-ingest.service
+
+[Install]
+WantedBy=default.target

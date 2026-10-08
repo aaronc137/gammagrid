@@ -101,7 +101,8 @@ MAX_ZERO_OI_FRACTION = 0.5
 # long-lived contract's early history. The dashboard carries a "Load full
 # history" toggle that passes days=None straight through — bounded by default,
 # unbounded on request, never unbounded-then-secretly-trimmed.
-SNAPSHOT_HISTORY_DAYS = int(os.environ.get("SNAPSHOT_HISTORY_DAYS", "365"))
+# morning-bites: 一天三班 × SPX 3 万行, 15 天 ≈ 1.4M 行; 365 天起不来。
+SNAPSHOT_HISTORY_DAYS = int(os.environ.get("SNAPSHOT_HISTORY_DAYS", "15"))
 
 
 # --- scheduled collection ---
@@ -156,14 +157,6 @@ UNUSUAL_HISTORY_DAYS = 60
 # through in a few dozen cycles. Nothing waits on it: the screens already show
 # our number, and only the historical average is catching up.
 IV_BACKFILL_MOMENTS_PER_PASS = int(os.environ.get("IV_BACKFILL_MOMENTS_PER_PASS", "50"))
-
-# How often the symbol directory behind the Add-ticker search box is downloaded
-# again. Weekly rather than nightly, and the difference is who is paying for it:
-# this product runs on somebody's own machine, the file changes by a handful of
-# rows a week, and a daily request to a third party is not something to sign an
-# installation up for without a reason. A missing catalogue is fetched
-# immediately whatever this says — see app/catalogue.py.
-CATALOGUE_REFRESH_DAYS = int(os.environ.get("CATALOGUE_REFRESH_DAYS", "7"))
 
 # Contracts expired longer ago than this move to option_snapshots_archive.
 # Nothing is deleted; the point is only to keep the table every live query
@@ -267,7 +260,32 @@ def _read_version() -> str:
     return f"v{released}+unreleased" if unreleased else f"v{released}"
 
 
-APP_VERSION = _read_version()
+APP_VERSION = _read_version() + "+mb"
+
+
+# --- morning-bites 定制 ---
+
+# morning-bites 的归档根(out/): 回放 out/gex/raw, 读 out/gex/<latest>.json 印晨刊口径, 写 out/gammagrid/ingest.ok。
+MB_OUT = os.environ.get("GG_MB_OUT", os.path.expanduser("~/morning-bites/out"))
+
+# 没有 Cloudflare Access 头就 st.stop()(纵深一层, 真正的门在隧道的 originRequest.access)。
+# 关掉只为无浏览器的检查(tests/render_views.py)与 ssh 端口转发的本机核对; 回环 Host 本来就放行。
+ACCESS_GATE = os.environ.get("GG_ACCESS_GATE", "1") == "1"
+
+# AGPL §13: 修改版经网络提供, 页脚要给出对应源码。部署脚本把提交号写进仓库根的 BUILD。
+FORK_URL = "https://github.com/aaronc137/gammagrid"
+UPSTREAM_URL = "https://github.com/gammagrid/gammagrid"
+
+
+def _read_build() -> str:
+    try:
+        with open(os.path.join(os.path.dirname(_CHANGELOG), "BUILD"), encoding="utf-8") as handle:
+            return handle.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+BUILD_COMMIT = _read_build()
 
 
 # How many failures in a row make a symbol hopeless rather than unlucky. Six is

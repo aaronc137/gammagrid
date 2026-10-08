@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### morning-bites fork (branch `morning-bites`, 2026-10-08)
+- **Data source is a replay of morning-bites' Cboe archive, not a live provider.** `app/providers/cboe_archive.py`
+  reads `out/gex/raw/*.json.gz`; `app/ingest_archive.py` ingests every snapshot the archive has (idempotent on
+  `(ticker, 'cboe', Cboe quote timestamp)`), drops expired series, merges SPX/SPXW, stamps `iv_model='provider'`.
+  Yahoo provider, the symbol catalogue and the TradingView embed are removed: the page makes no outside request.
+- **Implied volatility is the Cboe quote IV** (`app/metrics.py` passes `with_solved_iv` through); `metrics_core.py` untouched.
+- **GEX is shown per 1 % of spot** (× spot × 0.01 at display only; the database keeps per-$1), every figure labelled;
+  a header strip shows morning-bites' own levels (`gex_calc`) side by side, with both definitions spelled out.
+- Chinese UI, morning-bites dark palette, times always America/New_York, Access-header gate, AGPL source link in the sidebar.
+- `deploy/`: venv + `systemd --user` units (`gg-app`, `gg-ingest.path`).
+
 ### Changed
 - **The interface now reads the same as the hosted version.** Same palette,
   same three corner radii, same type scale — and, the change you notice first,

@@ -25,7 +25,6 @@ import sys
 import time
 
 from app import (
-    catalogue,
     collector,
     config,
     day_summary,
@@ -171,22 +170,6 @@ def fill_missing_day_summaries(conn) -> int:
     return written
 
 
-def refresh_catalogue_if_due(conn) -> int:
-    """Keep the Add-ticker search box's directory current. Returns symbols loaded.
-
-    Here rather than in the app for the same reason collection is: Streamlit
-    re-executes its whole script on every interaction, so a download started
-    from a page render is a download started again on every click. The worker
-    asks once a cycle and answers "not yet" from one setting almost every time.
-
-    It is also the only outbound call in this product that is not to the data
-    source, which is why it is bounded and visible rather than convenient: a
-    weekly cadence, a marker written even when the attempt fails, and a
-    complete degradation path — no catalogue means the box is a plain text
-    field, which is what it was before it existed.
-    """
-    return catalogue.refresh_if_due(conn)
-
 
 def catch_up_own_iv(conn) -> int:
     """Move a batch of stored volatility averages onto our own model.
@@ -268,9 +251,6 @@ def run_forever() -> None:
             # had been taken — which is exactly when a machine has time for it.
             # Costs one index-only read per ticker once there is nothing left.
             catch_up_own_iv(conn)
-            # Same argument, and the same cost when there is nothing to do: one
-            # setting read, then nothing for a week.
-            refresh_catalogue_if_due(conn)
             # Once a day, and for the same reason as the two above: a day row
             # that is missing makes a view about change look like an absence of
             # change, and the machines this runs on are switched off overnight.
@@ -299,7 +279,6 @@ def main(argv: list[str] | None = None) -> int:
             archive_if_due(conn)
             print(f"Collected {collect_once(conn)} ticker(s).")
             print(f"Recomputed {catch_up_own_iv(conn)} stored volatility average(s).")
-            print(f"Symbol directory: {refresh_catalogue_if_due(conn)} symbol(s) loaded.")
         finally:
             conn.close()
         return 0

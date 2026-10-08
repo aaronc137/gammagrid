@@ -1,10 +1,23 @@
-"""Streamlit UI. Display and user input only — all business logic lives in
-metrics.py (calculations) and collector.py (data collection)."""
+"""Streamlit 页面 —— morning-bites 定制版(晨读 · Gamma)。只管显示与输入; 算式在 metrics.py, 入库在 ingest_archive.py。
+
+与上游 dashboard.py 的差别(全部在这一层, metrics_core.py 不动):
+  * 没有加删票 / 「Collect data」/ 采集间隔 / 搜票框 / TradingView / GitHub 星标: 采集由 morning-bites 的归档驱动
+    (app/ingest_archive.py), 这一页零外部请求; 标的固定 SPX / SPY / QQQ。
+  * 中文、本站暗色; 时刻一律美东(viewtime.py)。
+  * GEX 展示单位换成「每 1% 波动的美元 gamma」(gammagrid 库里存的是每 $1, 只在显示处乘 现价 × 0.01), 逐处标口径;
+    页头并列晨刊四件套(读 morning-bites 的 out/gex/<latest>.json, 那是 gex_calc 的口径, 两套各标各的)。
+  * 墙 / 翻转位的**定义**不改(热图标注与状态句建在上面): 墙 = 各侧 OI 最大的行权价; 翻转位 = 离现价最近的累计穿零,
+    线性插值成价格。晨刊是 signed GEX 的 argmax / argmin 与 ±15% 带内升序第一次穿零(不插值), 页脚写明。
+  * 没有 Cloudflare Access 头就 st.stop()(纵深一层, 门在隧道)。
+
+Modified for morning-bites, 2026-10-08. 基于 GammaGrid v0.7.0, AGPL-3.0, 同本仓 LICENSE。
+"""
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+from pathlib import Path
 
 import altair as alt
 import numpy as np
@@ -14,20 +27,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from matplotlib.colors import LinearSegmentedColormap
 
-from app import (  # noqa: I001 — grouped by what they are, not alphabetised
-    catalogue,
-    collector,
-    config,
-    day_summary,
-    db,
-    freshness,
-    market_calendar,
-    metrics,
-    providers,
-    suggestions,
-    theme,
-    weather,
-)
+from app import config, day_summary, db, freshness, metrics, theme, weather  # noqa: I001 — grouped by what they are
 from app.viewtime import (
     format_date,
     format_datetime,
@@ -37,149 +37,140 @@ from app.viewtime import (
     with_viewer_index,
 )
 
-# Same 2x2 diagonal "chip" mark used as the favicon on gammagrid.io — keep
-# this data URI in sync with the teaser site's <link rel="icon"> if the mark
-# ever changes.
 FAVICON = (
-    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
-    "%3Crect width='32' height='32' fill='%230A0C0B'/%3E"
-    "%3Crect x='4' y='4' width='10' height='10' fill='%23B833E0'/%3E"
-    "%3Crect x='18' y='4' width='10' height='10' fill='%23222'/%3E"
-    "%3Crect x='4' y='18' width='10' height='10' fill='%23222'/%3E"
-    "%3Crect x='18' y='18' width='10' height='10' fill='%2322C55E'/%3E%3C/svg%3E"
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E"
+    "%3Crect width='16' height='16' fill='%230F1114'/%3E"
+    "%3Crect x='2' y='9' width='5' height='5' fill='%233DBA7A'/%3E"
+    "%3Crect x='9' y='2' width='5' height='5' fill='%23F26B5E'/%3E%3C/svg%3E"
 )
 
-st.set_page_config(page_title="GammaGrid", page_icon=FAVICON, layout="wide")
-
+st.set_page_config(page_title="晨读 · Gamma", page_icon=FAVICON, layout="wide")
 st.markdown(theme.stylesheet(), unsafe_allow_html=True)
 
 
-def _drop_stale_choice(key: str, options) -> None:
-    """Forgets a stored selection that is no longer offered.
+# --- 鉴权: 只信 Cloudflare Access ---------------------------------------------
+# 隧道的 originRequest.access 已经在 cloudflared 验过 JWT 才会转发到这里; 这一层是纵深: 任何不经隧道、
+# 又不是回环地址的请求(Host 不是 127.0.0.1 / localhost)没有那个头就停。bare 模式(tests/render_views.py)
+# 与 ssh 端口转发的本机核对都是回环, 照常渲染。
 
-    Streamlit raises when a widget's remembered value is absent from its
-    options, and these lists narrow as the user drills down — pick an expiry
-    that lists strike 275, then one that does not, and the Contract tab would
-    die on a perfectly ordinary sequence of clicks."""
+def _headers() -> dict[str, str]:
+    try:
+        raw = st.context.headers
+    except Exception:  # noqa: BLE001 — 无浏览器, 无 context
+        return {}
+    try:
+        return {str(k).lower(): str(v) for k, v in raw.items()} if raw else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+_h = _headers()
+_host = _h.get("host", "").split(":")[0]
+if config.ACCESS_GATE and _host not in ("", "127.0.0.1", "localhost") and not _h.get("cf-access-jwt-assertion"):
+    st.error("请经站点入口访问(这一页只在 Cloudflare Access 之后提供)。")
+    st.stop()
+
+
+def _drop_stale_choice(key: str, options) -> None:
+    """控件记住的旧值不在新选项里时忘掉它, 否则 Streamlit 直接抛。"""
     if key in st.session_state and st.session_state[key] not in list(options):
         del st.session_state[key]
 
 
-# The catalogue, cached. It is ~5,300 rows and the file behind it is downloaded
-# weekly, so re-reading it on every rerun would be a query per click for an
-# answer that cannot have moved.
-#
-# Five minutes rather than an hour, and the reason is not the file: the ORDER
-# depends on what this installation watches, so a symbol just added should reach
-# the top of the list within a rerun or two rather than at the top of the hour.
-#
-# Caching does not reduce what crosses the wire — the whole list goes to the
-# browser on every rerun — and that is the price of filtering without a round
-# trip. It is also why this list is not made longer than it has to be.
-@st.cache_data(ttl=300)
-def _cached_catalogue_options(_conn, watched: tuple[str, ...]) -> list[tuple[str, str]]:
-    return catalogue.options(_conn, list(watched))
+GEX_UNIT = "每 1% 波动的美元 gamma"
 
 
-@st.cache_data(ttl=1800)
-def _cached_has_options(ticker: str) -> bool | None:
-    """Does this symbol have a chain to collect — asked once per symbol.
-
-    Cached because it is a network call sitting behind a button somebody may
-    press twice, and because the answer for a given symbol does not change
-    within half an hour. `None` is cached too, and deliberately: when the
-    source could not answer, the ticker is accepted, so there is nothing to
-    re-ask.
-
-    Called through getattr rather than as a plain method — a provider written
-    against the published interface need not have this, and a missing method
-    means "cannot find out", which is the same as None.
-    """
-    check = getattr(providers.get_provider(), "underlying_has_options", None)
-    return None if check is None else check(ticker)
+def per_pct(value: float | None, spot: float) -> float | None:
+    """gammagrid 的 GEX 是每 $1 的美元 gamma; 本站全站用每 1%(× 现价 × 0.01), 与晨刊 / 静态 Gamma 页同一单位。"""
+    return weather.per_pct(value, spot)
 
 
-@st.cache_data(ttl=1800)
-def _cached_collection_depth() -> dict[str, dt.date]:
-    """First collection date per ticker. Half an hour is right for a fact that
-    only changes when a ticker is collected for the very first time."""
-    return db.collection_depth(db.get_connection())
+# --- 晨刊口径(morning-bites 的 gex_calc)-------------------------------------
+_SESSION_ORDER = {"premarket": 0, "intraday": 1, "close": 2}
+_SESSION_ZH = {"premarket": "盘前", "intraday": "盘中", "close": "收盘"}
 
 
+@st.cache_data(ttl=120)
+def _mb_latest_read(ticker: str) -> dict | None:
+    """out/gex/<latest>.json 里这个标的的四件套(spot / 净 GEX / 双墙 / 翻转位 / 报价时刻)。读不到就 None, 页面不印那一行。"""
+    files = [p for p in Path(config.MB_OUT, "gex").glob("????-??-??-*.json") if p.stem[11:] in _SESSION_ORDER]
+    for path in sorted(files, key=lambda p: (p.stem[:10], _SESSION_ORDER[p.stem[11:]]), reverse=True):
+        try:
+            snap = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for read in snap.get("reads") or []:
+            if str(read.get("ticker", "")).upper() == ticker.upper():
+                return {**read, "date": snap.get("date"), "session": snap.get("session")}
+        return None
+    return None
 
+
+def render_mb_strip(read: dict | None) -> None:
+    if not read:
+        return
+    def _n(v, fmt="{:,.2f}"):
+        return "—" if v is None else fmt.format(v)
+    levels = "".join(
+        f"<div><dt>{label}</dt><dd{cls}>{value}</dd></div>"
+        for label, value, cls in (
+            ("现价", _n(read.get("spot")), ""),
+            ("净 GEX · 每 1%", weather.format_gex(read.get("net_gex")),
+             ' class="gg-green"' if (read.get("net_gex") or 0) >= 0 else ' class="gg-purple"'),
+            ("Call 墙", _n(read.get("call_wall"), "{:g}"), ' class="gg-green"'),
+            ("Put 墙", _n(read.get("put_wall"), "{:g}"), ' class="gg-purple"'),
+            ("累计穿零档", _n(read.get("flip"), "{:g}"), ""),
+        )
+    )
+    st.markdown(
+        '<div class="gg-mb"><div class="gg-mb-words"><div class="gg-mb-label">晨刊口径'
+        '<span class="gg-weather-scope"> · morning-bites gex_calc · Cboe 厂商 gamma · 全部未到期到期日</span></div>'
+        f'<div class="gg-weather-sentence">{read.get("date")} {_SESSION_ZH.get(read.get("session"), read.get("session"))}'
+        f' · Cboe 报价时刻 {read.get("quote_timestamp")} UTC · 墙 = signed GEX 极值档, 穿零 = ±15% 带内升序第一次由负转非负的行权价'
+        '(不插值) —— 与下面 gammagrid 的定义不同, 两套各标各的, 不可互换</div></div>'
+        f'<dl class="gg-levels">{levels}</dl></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# --- 单合约 ---------------------------------------------------------------------
 
 def render_option_detail(
     conn, df: pd.DataFrame, selected_ticker: str, tracked: pd.DataFrame,
     opt_expiry: pd.Timestamp, opt_strike: float, opt_type: str, key_prefix: str,
 ) -> None:
-    """Price/IV/greeks history for a specific contract — shared renderer for the
-    Contract tab and for the contract card on the Screener (row click), so the
-    logic isn't duplicated in two places. `key_prefix` — tabs render in the same
-    script run simultaneously (Streamlit doesn't lazy-render tabs), so widgets
-    with identical labels in both places need distinct keys."""
+    """一份合约的价格 / IV / greeks 历史 —— 「单合约」视图与筛选器点开一行共用。"""
     already_tracked = not tracked.empty and (
         (tracked["expiry"] == opt_expiry)
         & (tracked["strike"] == opt_strike)
         & (tracked["option_type"] == opt_type)
     ).any()
     if already_tracked:
-        st.caption("📌 pinned")
-    elif st.button("📌 Pin", key=f"{key_prefix}_pin_contract"):
+        st.caption("📌 已钉住")
+    elif st.button("📌 钉住", key=f"{key_prefix}_pin_contract"):
         db.add_tracked_contract(conn, selected_ticker, opt_expiry, opt_strike, opt_type)
         st.rerun()
 
     greeks_history = metrics.contract_greeks_history(df, opt_strike, opt_expiry, opt_type)
-
     if greeks_history.empty:
-        st.info("No history for the selected contract.")
+        st.info("这份合约没有历史。")
         return
 
     price_column, attribution_column = st.columns(2)
     with attribution_column:
         render_greek_attribution(greeks_history)
-
     with price_column:
-        st.subheader("Option price")
-        st.line_chart(with_viewer_index(greeks_history)["last_price"], color=BRAND_PURPLE)
-    with st.expander("ℹ️ How to read this"):
-        st.write(
-            "Price history of this specific contract (last price at each collection). "
-            "Compare the option's price action with the underlying's move and with the IV "
-            "dynamics below — if the option is gaining faster than the stock move explains, "
-            "it's likely volatility itself that's rising (see Vega in the greeks block)."
-        )
+        st.subheader("合约价格")
+        st.line_chart(with_viewer_index(greeks_history)["last_price"], color=theme.PRIMARY)
+    with st.expander("ℹ️ 怎么读"):
+        st.write("每班采集时这份合约的最后成交价。盘前 / 冷门档的最后成交价可能是上一场的, 与 IV 对不上时以 IV 为准。")
 
-    st.subheader("Contract implied volatility")
-    st.line_chart(with_viewer_index(greeks_history)["implied_volatility"], color=BRAND_GREEN)
-
+    st.subheader("合约隐含波动率(Cboe 报价 IV)")
+    st.line_chart(with_viewer_index(greeks_history)["implied_volatility"], color=theme.ACCENT)
     latest_iv = greeks_history.iloc[-1]["implied_volatility"]
-    # READ, NOT FETCHED. These figures come from daily closes, which cannot
-    # change during a session, so they are stored once a day by the collection
-    # pass and read here. This used to be a six-month price-history download
-    # made while the page was being drawn.
-    stored_rv = db.get_realized_volatility(conn, selected_ticker)
-    if stored_rv:
-        as_of, rv, rv_source = stored_rv
-        st.caption(
-            f"Current contract IV: **{latest_iv:.1%}**. Realized volatility of the underlying "
-            f"(close-to-close, from {rv_source} daily closes as of {format_date(as_of)} — its "
-            "depth doesn't depend on how many days we've been collecting option chains, which "
-            "is why it isn't drawn as a line on the same chart: the time scales are too "
-            "different): "
-            + " · ".join(f"RV({window}d) **{value:.1%}**" for window, value in sorted(rv.items()))
-        )
-        st.caption(
-            "IV well above RV — the market is pricing a premium for future uncertainty "
-            "(normal ahead of earnings/events). IV below RV is a rare situation — the option "
-            "may be underpriced relative to the underlying's actual recent volatility."
-        )
-    else:
-        st.caption(
-            "Realized volatility of the underlying: not stored yet — it is written once a day "
-            "by the collection pass, so it appears after the next collection."
-        )
+    st.caption(f"当前合约 IV **{latest_iv:.1%}**。已实现波动率本站不算(没有价格历史源)。")
 
-    st.subheader("Greeks over time")
+    st.subheader("Greeks 随时间")
     greek_cols = ["delta", "gamma", "theta", "vega", "rho", "vanna", "charm"]
     left, right = st.columns(2)
     for i, greek in enumerate(greek_cols):
@@ -187,54 +178,28 @@ def render_option_detail(
         target.caption(greek.capitalize())
         target.line_chart(
             with_viewer_index(greeks_history)[greek],
-            color=BRAND_PURPLE if i % 2 == 0 else BRAND_GREEN,
+            color=theme.PRIMARY if i % 2 == 0 else theme.ACCENT,
         )
-
-    with st.expander("📊 Interpreting current values and their trend"):
+    with st.expander("📊 当前值与趋势(上游英文原话)"):
         for note in metrics.interpret_greeks(greeks_history):
             st.write(f"- {note}")
 
 
 def render_greek_attribution(greeks_history: pd.DataFrame) -> None:
-    """Where the contract's money went, split by greek.
-
-    A WATERFALL, because it is the only shape that shows the arithmetic: the
-    bars start at the price the contract had, each greek moves it, and the last
-    bar lands on the price it has now — so the residual is not a number beside
-    the chart, it is the bar that closes the gap.
-
-    In cents. The terms on a 19c option are hundredths of a dollar, and
-    "-0.476" invites a misread that "-47.6c" does not.
-    """
+    """合约价格变动按 greek 拆分的瀑布图, 单位美分。"""
     attribution = metrics.greek_attribution(greeks_history)
-    st.subheader("Where the price went")
+    st.subheader("价格去了哪")
     if attribution.by_day.empty:
-        # SAY WHICH REASON IT WAS. There are two, and until this branch
-        # separated them the panel reported the wrong one: a contract whose
-        # every day sits under the cent floor was told its implied volatility
-        # had failed the data-quality guard, which sends the reader hunting for
-        # a data problem that does not exist. Measured on the 60 most-collected
-        # SPY contracts in a real database: 47 decompose, 13 are refused, and
-        # every one of those 13 is refused for being cheap rather than for
-        # anything to do with IV.
         if attribution.dropped_cheap:
             st.info(
-                f"This contract traded under {config.ATTRIBUTION_MIN_PRICE * 100:.0f}c on "
-                f"{attribution.dropped_cheap} of the day(s) collected, and the split is not "
-                "shown for those: at a few cents a contract, every greek is arithmetic about "
-                "rounding and the decomposition would be noise reported as a finding. Deeper "
-                "in-the-money contracts on this ticker will show it."
+                f"这份合约有 {attribution.dropped_cheap} 天成交价低于 {config.ATTRIBUTION_MIN_PRICE * 100:.0f} 美分, "
+                "那几天不拆: 几美分的合约上每个 greek 都是四舍五入的算术。"
             )
         else:
-            st.info(
-                "Not enough usable days yet to split the price change by greek. This needs "
-                "at least two days whose implied volatility passed the data-quality guard — "
-                "and with collection on a schedule, days that are actually a day apart."
-            )
+            st.info("可用天数不够(至少要两个相隔一天的交易日)。")
         return
-
     totals = attribution.totals
-    labels = ["Start", "Delta", "Gamma", "Vega", "Theta", "Residual", "End"]
+    labels = ["起点", "Delta", "Gamma", "Vega", "Theta", "残差", "终点"]
     steps = [totals[name] * 100 for name in (*metrics.ATTRIBUTION_TERMS, "residual")]
     figure = go.Figure(go.Waterfall(
         orientation="v",
@@ -243,735 +208,176 @@ def render_greek_attribution(greeks_history: pd.DataFrame) -> None:
         y=[attribution.start_price * 100, *steps, 0],
         text=waterfall_labels(attribution.start_price * 100, steps),
         textposition="outside",
-        decreasing={"marker": {"color": BRAND_PURPLE}},
-        increasing={"marker": {"color": BRAND_GREEN}},
-        totals={"marker": {"color": "#8B8194"}},
-        connector={"line": {"color": "#3A3340"}},
+        decreasing={"marker": {"color": theme.PRIMARY}},
+        increasing={"marker": {"color": theme.ACCENT}},
+        totals={"marker": {"color": theme.MUTED}},
+        connector={"line": {"color": theme.BORDER}},
     ))
     figure.update_layout(
-        height=300, margin={"l": 8, "r": 8, "t": 8, "b": 8},
-        showlegend=False, yaxis={"title": "¢ per share", "zeroline": True},
+        height=300, margin={"l": 8, "r": 8, "t": 8, "b": 8}, paper_bgcolor=theme.SURFACE, plot_bgcolor=theme.SURFACE,
+        font={"color": theme.TEXT}, showlegend=False, yaxis={"title": "美分 / 股", "zeroline": True},
     )
     st.plotly_chart(figure, use_container_width=True)
 
     cumulative = attribution.by_day[["day", *metrics.ATTRIBUTION_TERMS]].copy()
     for name in metrics.ATTRIBUTION_TERMS:
         cumulative[name] = cumulative[name].cumsum() * 100
-    st.caption("Running total by day, in cents — when each greek did its work")
+    st.caption("逐日累计, 美分 —— 每个 greek 在哪天起作用")
     st.line_chart(
         with_viewer_index(cumulative, "day"), height=200,
-        color=[BRAND_GREEN, "#F5B342", BRAND_PURPLE, "#5AA9E6"],
+        color=[theme.ACCENT, "#E8C46A", theme.PRIMARY, "#5FA4E0"],
     )
-
-    # WHAT A DAY MEANS HERE, said in the interface and not only in the code.
-    # This product can be collected by hand, and then "a day" is whatever the
-    # person happened to press: today at 17:40, tomorrow at 11:05. Theta is
-    # charged per calendar day and stays honest; the delta term does not, and
-    # the difference lands in the residual looking like noise in the data rather
-    # than a consequence of the schedule.
     spans = attribution.by_day["missing_trading_days"]
-    st.caption(
-        f"A day is the LAST collection of each trading day, New York time — "
-        f"{len(attribution.by_day)} interval(s) in this window. Collect on a schedule for "
-        "these numbers to mean what they say."
-    )
+    st.caption(f"「一天」= 每个交易日(美东)最后一班采集 —— 本窗口 {len(attribution.by_day)} 个区间。")
     notes = []
     if attribution.dropped_cheap:
-        notes.append(
-            f"{attribution.dropped_cheap} day(s) left out: the contract traded below "
-            f"{config.ATTRIBUTION_MIN_PRICE * 100:.0f}c there, where implied volatility "
-            "inverted from a one-cent quote makes every greek meaningless."
-        )
+        notes.append(f"{attribution.dropped_cheap} 天未计入: 成交价低于 {config.ATTRIBUTION_MIN_PRICE * 100:.0f} 美分。")
     if attribution.dropped_unreliable:
-        notes.append(
-            f"{attribution.dropped_unreliable} day(s) left out: their implied volatility "
-            "failed the outlier guard, so the greeks are missing rather than wrong."
-        )
+        notes.append(f"{attribution.dropped_unreliable} 天未计入: IV 没过离群守卫。")
     if int(spans.sum()):
-        notes.append(
-            f"{int(spans.sum())} trading day(s) inside the window were never collected — "
-            "their moves are folded into the neighbouring interval, not counted as zero. "
-            "The gamma term approximates a move locally; over a stretched interval it "
-            "approximates less well, and the difference lands in the residual."
-        )
+        notes.append(f"窗口内 {int(spans.sum())} 个交易日没有采集, 它们的变动并进相邻区间, 落在残差里。")
     residual_share = abs(totals["residual"]) / max(abs(totals["actual"]), 1e-9)
     if residual_share > 0.5:
-        notes.append(
-            f"The residual is {residual_share:.0%} of the whole move: the model does not "
-            "explain this contract — the spread, a stale print or a rate move did more "
-            "than the greeks."
-        )
+        notes.append(f"残差占整段变动的 {residual_share:.0%}: 模型解释不了这份合约 —— 价差、陈旧成交或利率的作用大过 greeks。")
     for note in notes:
         st.caption(f"⚠️ {note}")
 
 
 def waterfall_labels(start: float, steps: list[float]) -> list[str]:
-    """Bar labels for the waterfall, including the total.
-
-    Computed here rather than from the `y` array, because Plotly IGNORES the y
-    value of a `measure="total"` bar and derives its height itself — so the
-    array carries a zero there, and a label built from it announces a contract
-    worth nothing. The total is the sum, and this is the one place that says so.
-    """
-    return [f"{start:.1f}¢", *(f"{value:+.1f}¢" for value in steps),
-            f"{start + sum(steps):.1f}¢"]
+    return [f"{start:.1f}¢", *(f"{value:+.1f}¢" for value in steps), f"{start + sum(steps):.1f}¢"]
 
 
 def format_compact(value: float) -> str:
-    """1234 -> "1.2k", 1_500_000 -> "1.5m" — shorter than "1,234,567", so more
-    expiry columns fit on screen without horizontal scrolling."""
+    """1234 → 1.2k, 1.5e9 → 1.5b: 热图格子里放得下。"""
     if pd.isna(value) or value == 0:
         return "0"
     sign = "-" if value < 0 else ""
     magnitude = abs(value)
-    if magnitude >= 1_000_000:
-        return f"{sign}{magnitude / 1_000_000:.1f}m"
-    if magnitude >= 1_000:
-        return f"{sign}{magnitude / 1_000:.1f}k"
+    for limit, suffix in ((1e9, "b"), (1e6, "m"), (1e3, "k")):
+        if magnitude >= limit:
+            return f"{sign}{magnitude / limit:.1f}{suffix}"
     return f"{sign}{magnitude:.0f}"
 
 
-GEX_CMAP = LinearSegmentedColormap.from_list("gex_dark", ["#b833e0", "#0d0d0d", "#22c55e"])
-
-# Brand accent pair, reused across every chart below instead of Streamlit's
-# default blue palette — purple as the primary series, green as the
-# secondary/comparison one, so the color language stays consistent with the
-# heatmap and the gammagrid.io teaser. The IV surface deliberately stays on
-# Viridis rather than a brand gradient: a perceptually-uniform scale reads
-# far better on a continuous 3-D surface.
-BRAND_PURPLE = "#B833E0"
-BRAND_GREEN = "#22C55E"
+GEX_CMAP = LinearSegmentedColormap.from_list("gex_dark", [theme.PRIMARY, theme.BACKGROUND, theme.ACCENT])
 
 
 def style_gex_matrix(matrix: pd.DataFrame, atm_strike: float | None = None):
-    """Zero-centered color scale on a BLACK background (custom diverging palette
-    `GEX_CMAP`, not the stock PRGn with its light center) — matches the app's
-    dark theme and the reference tool. Text (abbreviated, `format_compact`) and
-    color are computed separately (`gmap`) — so the text can be shortened (1.2k
-    instead of 1,234) independently of the exact numbers, which stay in the
-    source matrix solely for color computation.
-
-    `vmax` is taken not as the true maximum but as the 90th percentile of
-    nonzero |values| — otherwise a single strong outlier (common in GEX: one
-    ATM cell an order of magnitude above its neighbors) stretches the scale so
-    far that nearly all other cells become indistinguishably washed out. Cells
-    beyond vmax are simply painted the limit color — expected behavior for a
-    heatmap; the exact number is still visible in the cell text.
-
-    If `atm_strike` is given, the row closest to the underlying price is marked
-    with a "➤" marker in the index and highlighted as a whole. Streamlit does
-    not marshal index styles from a pandas Styler (`cellstyle_index` from
-    `Styler._translate()` is simply dropped — verified against the
-    `pandas_styler_utils.py` sources), so `Styler.map_index()` won't work for
-    this: it has to be index text (guaranteed to display) plus styling of
-    regular data cells (`cellstyle` is marshaled, that works)."""
+    """零居中的双色热图(负 = 放大色, 正 = 抑制色), 色阶取非零 |值| 的 90 分位。"""
     display = matrix.rename(columns=format_date)
     numeric = display.to_numpy(dtype=float)
     nonzero_abs = np.abs(numeric[numeric != 0])
     vmax = np.percentile(nonzero_abs, 90) if nonzero_abs.size else 0
     vmax = vmax if vmax > 0 else 1
-
     text = display.map(format_compact)
-
-    # Convert the ENTIRE index to strings (not just the ATM row) — mixing floats
-    # and a single str label in one Index yields an object-dtype column that
-    # pyarrow cannot serialize directly (ArrowInvalid when rendering in
-    # Streamlit, visible only in container logs — the widget itself suppresses
-    # the error with an auto-fix, but that's extra fragility and an extra
-    # traceback in the logs on every render).
     atm_label = None
     if atm_strike is not None and atm_strike in text.index:
         atm_label = f"➤ {atm_strike:g}"
     text.index = [atm_label if v == atm_strike else f"{v:g}" for v in text.index]
-
     styler = text.style.background_gradient(
         cmap=GEX_CMAP, vmin=-vmax, vmax=vmax, gmap=numeric, axis=None, text_color_threshold=0.6
     )
     if atm_label is not None:
         def highlight_atm_row(row: pd.Series) -> list[str]:
-            style = "border-top: 2px solid #f59e0b; border-bottom: 2px solid #f59e0b; font-weight: 700;"
+            style = f"border-top: 2px solid {theme.WARNING}; border-bottom: 2px solid {theme.WARNING}; font-weight: 700;"
             return [style if row.name == atm_label else "" for _ in row]
-
         styler = styler.apply(highlight_atm_row, axis=1)
     return styler
 
 
-def render_tradingview_widget(ticker: str, height: int = 300) -> str:
-    """Auxiliary visualization (not a data source for the app — the focus stays
-    on options analytics). The ticker is passed as-is, with no exchange-prefix
-    mapping (NASDAQ:/AMEX:/...) — TradingView resolves the symbol itself; if
-    some ticker resolves to the wrong thing, we'll deal with it then."""
-    config_json = json.dumps({
-        "width": "100%",
-        "height": height,
-        "symbol": ticker,
-        "interval": "D",
-        "timezone": "Etc/UTC",
-        "theme": "dark",
-        "style": "1",
-        "locale": "en",
-        "hide_legend": True,
-        "hide_top_toolbar": False,
-        "hide_side_toolbar": True,
-        "allow_symbol_change": False,
-        "save_image": False,
-        "support_host": "https://www.tradingview.com",
-    })
-    # autosize:true did not stretch the canvas to the container's full height in
-    # this (nested iframe) context — it left an empty tail at the bottom.
-    # Explicit width/height in the widget config instead of autosize fixes
-    # exactly that.
-    return f"""
-    <div class="tradingview-widget-container" style="height:{height}px;width:100%;margin:0;padding:0">
-      <div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
-      {config_json}
-      </script>
-    </div>
-    """
-
-
 conn = db.get_connection()
 
-# The teaser's grid background and mono display type, applied globally so
-# the app shares the gammagrid.io visual language instead of reading as bare
-# default Streamlit. Deliberately NOT touching st.dataframe/st.data_editor
-# styling: dense tables need to stay plain and readable, not branded —
-# over-styling them would visually overload the page.
-st.markdown(
-    """
-    <style>
-      .stApp {
-        background-image:
-          linear-gradient(#1C2320 1px, transparent 1px),
-          linear-gradient(90deg, #1C2320 1px, transparent 1px);
-        background-size: 64px 64px;
-        background-position: center -1px;
-      }
-      [data-testid="stHeading"] h1,
-      [data-testid="stHeading"] h2,
-      [data-testid="stHeading"] h3 {
-        font-family: "SF Mono","JetBrains Mono","IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
-      }
-      [data-testid="stTab"] p {
-        font-family: "SF Mono","JetBrains Mono","IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
-        letter-spacing: .02em;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Header wordmark: the same 2x2 diagonal chip mark as the favicon, next to the
-# title, matching the teaser site and the hosted product's header — small,
-# because the header is a place to know where you are rather than a page
-# banner, and the screen belongs to the chain below it.
 st.markdown(
     f"""
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:0.25rem;">
-      <div style="display:grid;grid-template-columns:13px 13px;grid-template-rows:13px 13px;gap:3px;flex-shrink:0;">
-        <div style="background:{theme.PRIMARY};"></div>
-        <div style="background:{theme.BORDER};"></div>
-        <div style="background:{theme.BORDER};"></div>
-        <div style="background:{theme.ACCENT};"></div>
-      </div>
-      <span style="font-size:{theme.TEXT_STRONG};font-weight:700;letter-spacing:0.01em;">GammaGrid</span>
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:0.25rem;">
+      <span style="font-size:{theme.TEXT_STRONG};font-weight:700;letter-spacing:0.01em;">晨读 · Gamma</span>
+      <span style="color:{theme.MUTED};font-size:{theme.TEXT_BASE};">Cboe 期权链 · 回放 morning-bites 的三班归档 · 零外部请求</span>
     </div>
     """,
     unsafe_allow_html=True,
-)
-st.caption(
-    "Open-source options positioning dashboard — dealer gamma exposure, max pain, "
-    "open interest, and IV surface for your whole watchlist."
 )
 
 with st.sidebar:
-    st.header("Watchlist")
+    st.header("标的")
     watchlist = db.get_watchlist(conn)
-
-    # ONE BOX THAT FILTERS AS YOU TYPE, and it replaced a plain text field for a
-    # reason that has nothing to do with looks. A field you can only type into
-    # is a field you can only be wrong in: it cannot tell somebody that what
-    # they want exists under another name, because it does not know what
-    # exists. `APPL`, `NVIDIA`, `NASDAQ` and `BTCUSD` all have the shape of a
-    # ticker, and all of them used to be accepted and then fail forever.
-    #
-    # A SELECTBOX HOLDING THE WHOLE CATALOGUE FILTERS IN THE BROWSER, on every
-    # keystroke, and empties the moment the box is cleared. A server-side search
-    # cannot: Streamlit hands a text field's value to Python only when it loses
-    # focus, so somebody typing "Apple" would see nothing at all until they
-    # clicked elsewhere — and if they went straight for the Add button instead,
-    # they would never see a suggestion.
-    #
-    # `accept_new_options` makes the same widget the fallback for a symbol the
-    # directory does not list, so there is one door instead of two — and it is
-    # what keeps this working on an installation whose catalogue is empty
-    # because the download failed or the worker has never run.
-    #
-    # `filter_mode="contains"` rather than the default fuzzy match: fuzzy
-    # re-sorts by its own score and throws away the ordering this list was built
-    # with, and that ordering is most of what makes the search useful.
-    _options = _cached_catalogue_options(conn, tuple(watchlist))
-    _label_to_symbol = {label: symbol for symbol, label in _options}
-    # The directory as a set — the only statement this product holds that a
-    # string is a real security with listed options. It is what tells "AAPX,
-    # deliberately typed" apart from "APPL, mistyped", and what resolves SAP.DE
-    # to SAP without a map of European companies.
-    _catalogue_symbols = set(_label_to_symbol.values())
-    _choice = st.selectbox(
-        "Add ticker",
-        options=list(_label_to_symbol),
-        index=None,
-        placeholder="AAPL or Apple",
-        accept_new_options=True,
-        filter_mode="contains",
-        key="add_ticker_choice",
-        help=(
-            "Search by symbol or company name, or type a symbol that is not "
-            "listed. Data comes from Yahoo Finance (yfinance), and not every "
-            "listed chain is available there. US-listed options only — European "
-            "and Asian listings (SAP.DE, ASML.AS) have no options data here, but "
-            "most large non-US companies also trade in the US as ADRs, which do: "
-            "try ASML, SAP, SHEL, NVO, BUD."
-        ),
-    )
-    new_ticker = (_label_to_symbol.get(_choice) or (_choice or "")).strip().upper()
-
-    # Said once, and only while it is true. An empty directory is not a failure
-    # anybody has to act on — the box still accepts anything typed into it — but
-    # somebody who expected to search for "Apple" and got nothing deserves to
-    # know it is the catalogue that has not arrived, not their spelling.
-    if not _catalogue_symbols:
-        st.caption(
-            "The symbol directory has not been downloaded yet, so this box cannot "
-            "search by company name — type the symbol itself. It arrives on the "
-            "collector's next pass."
-        )
-
-    depth = _cached_collection_depth()
-
-    # ONE ANSWER TO ONE QUESTION. Three mechanisms used to speak here — the
-    # provider's refusal list, the map of instruments with no US options, and
-    # the typo search — in three places, in three voices, and with holes between
-    # them: SAP.DE, BTCUSDT and 9988.HK got nothing at all while the help text
-    # under this very box named ADRs as the answer.
-    #
-    # ASKED ON EVERY KEYSTROKE AND NEVER OVER THE NETWORK. Everything it needs
-    # is already in memory — the provider's declared refusals, the catalogue
-    # just handed to the widget, and the tickers already collected — so somebody
-    # who typed SAP.DE reads the answer instead of waiting seconds for Yahoo to
-    # say the same no.
-    _provider = providers.get_provider()
-    _unsupported_here = getattr(_provider, "unsupported_symbols", {}) or {}
-    _proposal = suggestions.propose(
-        new_ticker,
-        depth.keys(),
-        in_catalogue=_catalogue_symbols.__contains__,
-        unsupported=_unsupported_here,
-        provider=_provider.name,
-    )
-    # ONLY THE SOURCE'S OWN REFUSAL TAKES THE BUTTON AWAY. The rest is this
-    # product's reading of what somebody meant, and being wrong about that must
-    # cost them a sentence, not the ability to try.
-    if _proposal:
-        st.warning(_proposal.message)
-
-    # WHAT THIS TELLS SOMEBODY BEFORE THEY COMMIT, and it is said only when
-    # there is something to commit to. Two different things, and both used to be
-    # silence:
-    #
-    #   * a symbol with no chain to collect (APPL, NASDAQ, BTCUSD) was accepted
-    #     without a word and then failed on every cycle forever;
-    #   * a symbol that IS valid still starts its history today, so the first
-    #     chart is a single point — on a fresh install, always. Somebody who was
-    #     promised history and sees one dot concludes the tool is broken, and
-    #     they are not wrong to.
-    #
-    # AFTER THE PROPOSAL, AND NOT FOR A SYMBOL THE SOURCE HAS REFUSED. Promising
-    # that history "starts at the first collection" directly above a sentence
-    # saying there will never be one is the product contradicting itself in two
-    # consecutive lines.
-    if new_ticker and not (_proposal and _proposal.blocking):
-        since = depth.get(new_ticker)
-        if since:
-            st.caption(f"Already collected since {since:%d %b %Y}.")
-        else:
-            st.caption(
-                "History for a new ticker starts at the first collection — the first "
-                "chart will have one point, and fills in from there."
-            )
-
-    if st.button("Add", disabled=not new_ticker or bool(_proposal and _proposal.blocking)):
-        # THE LIVE CHECK STILL RUNS, and the catalogue does not replace it: the
-        # directory says a symbol has listed options somewhere, not that Yahoo
-        # will serve its chain. `is False` and not `not ...` — None means the
-        # source could not answer, and a ticker must never be refused on that. A
-        # false negative here looks like the product being broken; a false
-        # positive shows up in the collection log within the hour and is
-        # suspended by itself after six.
-        if _cached_has_options(new_ticker) is False:
-            # A symbol the directory lists is not "not a ticker". The limitation
-            # is ours, and saying otherwise costs the message its credibility
-            # with exactly the person who knows the symbol is real.
-            st.error(
-                suggestions.source_refusal(
-                    new_ticker, _unsupported_here.get(new_ticker), _provider.name
-                )
-                if new_ticker in _catalogue_symbols
-                else suggestions.refusal(
-                    new_ticker, watchlist, _catalogue_symbols.__contains__
-                )
-            )
-        else:
-            db.add_ticker(conn, new_ticker)
-            _cached_collection_depth.clear()
-            _cached_catalogue_options.clear()
-            st.rerun()
-
-    # Symbols that stopped being asked for. Marked in the list itself rather
-    # than only in the log: the watchlist is where somebody looks to find out
-    # what the tool is doing, and "quietly not collecting" is indistinguishable
-    # from "collecting fine" without a mark here.
-    suspended = db.unresolvable_tickers(conn)
     current_ticker = st.session_state.get("selected_ticker")
     for ticker in watchlist:
-        col1, col2 = st.columns([3, 1])
-        if col1.button(
-            f"⏸ {ticker}" if ticker in suspended else ticker,
-            key=f"select_ticker_{ticker}",
-            type="primary" if ticker == current_ticker else "secondary",
-            use_container_width=True,
-            help=(
-                f"Not being collected: every attempt has failed since "
-                f"{suspended[ticker]:%d %b %Y}, and nothing has ever been collected for it. "
-                "Check the spelling, or remove it. Nothing has been deleted."
-            ) if ticker in suspended else None,
+        if st.button(
+            ticker, key=f"select_ticker_{ticker}",
+            type="primary" if ticker == current_ticker else "secondary", use_container_width=True,
         ):
             st.session_state["selected_ticker"] = ticker
             st.rerun()
-        if col2.button("✕", key=f"remove_{ticker}"):
-            db.remove_ticker(conn, ticker)
-            if st.session_state.get("selected_ticker") == ticker:
-                # otherwise on the next run the selectbox would receive a value
-                # that is no longer among its options, and crash
-                st.session_state.pop("selected_ticker", None)
-            st.rerun()
-
     st.divider()
-    if st.button(
-        "Collect data",
-        type="primary",
-        disabled=not watchlist,
-        help="Best run while the US options market is open. Outside market "
-        "hours, Yahoo Finance often reports open_interest=0 across the whole "
-        "chain, which fails the collection for that ticker.",
-    ):
-        with st.spinner("Collecting data..."):
-            results = collector.collect_watchlist(conn, watchlist)
-        for ticker, status in results.items():
-            if status == "success":
-                st.success(f"{ticker}: OK")
-            elif status.startswith("skipped"):
-                # A deliberate decision not to try is not an error, and dressing
-                # it in red teaches people to ignore the red.
-                st.warning(f"{ticker}: {status}")
-            else:
-                st.error(f"{ticker}: {status}")
-
-    # Scheduled collection. The list is short on purpose: the floor is set by
-    # the data source rather than by preference, and a free-text box inviting
-    # "every minute" invites getting blocked. Off is the default — a tool that
-    # starts hitting an API the moment it is installed made a decision that was
-    # not its to make.
-    current_interval = db.get_collector_interval(conn)
-    labels = list(config.COLLECTOR_INTERVAL_CHOICES)
-    current_label = next(
-        (name for name, minutes in config.COLLECTOR_INTERVAL_CHOICES.items()
-         if minutes == current_interval),
-        labels[0],
-    )
-    chosen = st.selectbox(
-        "Collect automatically",
-        labels,
-        index=labels.index(current_label),
-        help="Runs in the background worker container, not in this page — it keeps "
-        "collecting while nobody is looking, and stops when you stop the containers.",
-    )
-    chosen_minutes = config.COLLECTOR_INTERVAL_CHOICES[chosen]
-    if chosen_minutes != current_interval:
-        db.set_collector_interval(conn, chosen_minutes)
-        st.rerun()
-
-    # The cost, stated at the moment of the decision and computed from THIS
-    # watchlist rather than from a generic figure — chain sizes differ by an
-    # order of magnitude between one small ticker and a few index ETFs.
-    if chosen_minutes > 0:
-        growth = db.estimated_growth_mb_per_month(conn, chosen_minutes)
-        if growth > 0:
-            st.caption(
-                f"About {growth / 1000:.1f} GB per month at this interval, for your current "
-                f"watchlist. Nothing is ever deleted; expired contracts move to a separate "
-                f"table after {config.CONTRACT_ARCHIVE_GRACE_DAYS} days."
-            )
-        else:
-            st.caption(
-                "Collect once first and this will say how much disk a month of collection "
-                "costs for your watchlist."
-            )
-        # Said here rather than in a FAQ, because this is where somebody picks a
-        # frequency and works out what it will cost.
-        #
-        # This comment used to claim the estimate above "already assumes the
-        # market is shut most of the week". It did not — the formula multiplied
-        # by 24 hours and 30 days, and overstated the answer roughly fivefold.
-        # The sentence was written in the same change that added the calendar:
-        # the consequence for the neighbouring function was reasoned out in
-        # words and never carried into the code. A comment asserting a property
-        # the code does not have is worse than no comment, because it is what
-        # the next reader checks INSTEAD of the formula.
-        st.caption(
-            "**Outside market hours the collector does not run.** US options trade "
-            "09:30–16:00 New York on weekdays; while the market is shut the chain does not "
-            "change, so one snapshot per closed day is taken as a safety net and the rest "
-            "are skipped — roughly four fifths of the week not spent on duplicates."
-        )
-    else:
-        st.caption("Automatic collection is off. Use the button above to collect on demand.")
-
-    # A cooldown that nobody can see is indistinguishable from the tool being
-    # broken — and worse, from the market simply being closed, which is a state
-    # this sidebar already describes a few lines above. Said in full: what
-    # happened, and when it stops.
-    cooldown_until = db.provider_cooldown_until(conn)
-    if cooldown_until is not None:
-        st.warning(
-            f"**The data source is limiting requests.** Collection is paused until "
-            f"{to_viewer(pd.Series([cooldown_until])).dt.strftime('%H:%M').iloc[0]} "
-            f"({timezone_label()}). This is not the market being closed — it is Yahoo "
-            "Finance refusing requests from this installation, usually after too many "
-            "in a short time. Nothing is lost; the next pass collects as usual."
-        )
-
-    with st.expander("📋 Collection log"):
-        st.caption(f"Times in your own timezone ({timezone_label()}).")
+    st.markdown("[← 晨读首页](/)  \n[静态 Gamma · 晨刊口径](/boards/gex.html)  \n[关键位回看](/boards/levels-review.html)")
+    st.divider()
+    with st.expander("📋 入库记录"):
+        st.caption(f"时刻为美东({timezone_label()})。每行一班一标的, started_at 是 Cboe 给那份链盖的报价时刻。")
         runs = db.get_recent_runs(conn, limit=30)
         if runs.empty:
-            st.caption("No collections yet.")
+            st.caption("还没有入库记录。")
         else:
             runs_display = runs.copy()
-            runs_display["started_at"] = to_viewer(runs_display["started_at"]).dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            runs_display["started_at"] = to_viewer(runs_display["started_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
             runs_display["oi_zero_fraction"] = runs_display["oi_zero_fraction"].map(
                 lambda v: f"{v:.0%}" if pd.notna(v) else "—"
             )
             st.dataframe(
-                runs_display[
-                    ["started_at", "ticker", "status", "rows_fetched", "oi_zero_fraction", "error_message"]
-                ],
-                use_container_width=True,
-                hide_index=True,
+                runs_display[["started_at", "ticker", "status", "rows_fetched", "oi_zero_fraction", "error_message"]],
+                use_container_width=True, hide_index=True,
             )
-        st.caption(
-            "`oi_zero_fraction` — the fraction of contracts with open_interest=0 in the "
-            f"collected chain. Above {config.MAX_ZERO_OI_FRACTION:.0%} the snapshot is "
-            "considered suspect and is not saved (status=failed, reason in `error_message`), "
-            "even if the request to the data source itself completed without a network error. "
-            "The most common cause is collecting outside regular market hours — Yahoo Finance "
-            "often reports open_interest=0 across the whole chain while the market is closed. "
-            "If a ticker keeps failing, try again during market hours."
-        )
-
     st.divider()
-
-    # A button, deliberately, and deliberately not a dialog. Measured over the
-    # fortnight to 18.08.2026: 64 people cloned this repository and 11 starred
-    # it. The ask does exist in the README — below the licence section, where
-    # nobody reading a quick start ever arrives. Somebody with the app open in
-    # front of them has already got further than any reader of the page.
-    #
-    # It sits here permanently rather than appearing after a successful
-    # collection: a prompt that waits for the moment you are pleased and then
-    # interrupts it is a trick, and the same trick costs us the collection
-    # result on the screen underneath. A button that is always in the same place
-    # can be pressed when the tool has earned it and ignored forever otherwise.
-    st.link_button(
-        "⭐ Star GammaGrid on GitHub",
-        "https://github.com/gammagrid/gammagrid",
-        use_container_width=True,
-        help="Stars are how people find this project — there is no marketing budget behind it.",
+    st.caption(
+        f"基于 [GammaGrid]({config.UPSTREAM_URL}) {config.APP_VERSION}(AGPL-3.0)修改 · "
+        f"修改版源码 [{config.FORK_URL.split('github.com/')[-1]}@{config.BUILD_COMMIT[:9]}]"
+        f"({config.FORK_URL}/tree/{config.BUILD_COMMIT})"
     )
-    st.caption("Questions or feedback: [hello@gammagrid.io](mailto:hello@gammagrid.io)")
-    # The revision, in the footer of the sidebar rather than in the header.
-    # Every self-hosted installation is a different version — people update
-    # when they feel like it and do not remember when — so a screenshot with no
-    # version in it starts every support conversation with a round of
-    # correspondence. One arrived with two collection errors and had to be
-    # dated by which caption was MISSING from it.
-    #
-    # Here specifically because this is the corner people photograph: the
-    # collection log is directly above, and it is what they are looking at when
-    # something has gone wrong. The header gets cropped.
-    st.caption(f"GammaGrid {config.APP_VERSION}")
 
 if not watchlist:
-    st.info("Add a ticker to the watchlist on the left to get started.")
+    st.info("还没有入库的快照: 等 gg-ingest 回放第一班 out/gex 归档。")
     st.stop()
 
-selected_ticker = st.selectbox("Ticker to analyze", watchlist, key="selected_ticker")
+selected_ticker = st.selectbox("标的", watchlist, key="selected_ticker")
 
-# Bounded by default, never a permanent cap on what you can see: collected data
-# is the most valuable thing in the app, and a rolling window must not silently
-# hide a long-lived contract's early history — an 18-month-old two-year LEAP
-# would lose its first year. days=None below fetches everything.
 load_full_history = st.checkbox(
-    f"Load full history (default: last {config.SNAPSHOT_HISTORY_DAYS} days)",
-    key="load_full_history",
-    help="Slower on tickers with a long collection history.",
+    f"加载全部历史(默认最近 {config.SNAPSHOT_HISTORY_DAYS} 天)",
+    key="load_full_history", help="SPX 一班 3 万行, 全部历史会慢。",
 )
 history_days = None if load_full_history else config.SNAPSHOT_HISTORY_DAYS
 
-# NO VIEW READS THE WHOLE TICKER. What used to be here was one frame of every
-# row this ticker has, loaded on every interaction and filtered in pandas by
-# whichever view was showing — which is fine while collection is a button and
-# stops being fine the moment it runs on a schedule. Measured on the hosted
-# product, which reached that point first: 3.1M rows, 22 seconds and 0.8 GB of
-# memory for one liquid ticker, to draw charts a few hundred points wide.
-#
-# Each view now asks for what it shows: one snapshot, two calendar days, one
-# contract, or a stored rollup. `db.get_snapshots` remains for tooling; if it
-# reappears in a view, this is what regressed.
-#
-# ONE SOURCE PER PAGE, resolved once here and passed to every read below rather
-# than looked up inside each of them: a render then pays for one small query
-# instead of a dozen identical ones. GammaGrid never blends two providers on
-# one screen — see db.active_source for why implied volatility makes that a
-# correctness problem and not a tidiness one.
 page_source = db.active_source(conn, selected_ticker)
 
 
 def with_our_iv(frame):
-    """Every chain this page draws goes through here.
-
-    THE VOLATILITY IS SOLVED FROM THE PRICE, not taken from the data source.
-    Yahoo — the source this product ships with, and for most installations the
-    only one — leaves implied volatility missing on part of a chain and reports
-    numbers that do not reproduce the quoted price on another part. Every greek,
-    the GEX profile, the screener's filters and the surface are built on that
-    column, so a chain with holes in it is a screen with holes in it.
-
-    Applied after the read rather than inside it, and applied to a frame that
-    was read for one moment or one contract: solving costs single-digit
-    milliseconds on a chain of a few thousand contracts, which is cheap enough
-    to redo on every rerun and far cheaper than a cache keyed on something that
-    can go stale.
-
-    WHERE THE PRICE DOES NOT DETERMINE A VOLATILITY, THE SOURCE'S NUMBER
-    STANDS. Refusing there would empty part of a liquid chain off the screener
-    and the profile, and a hole reads as a broken product rather than as an
-    honest silence. Which rows are ours is recorded in `iv_is_ours`, and the
-    source's own number is kept in `provider_implied_volatility` — throwing it
-    away would make "how far apart are the two models" unanswerable.
-    """
+    """每条链都经这里: morning-bites 版直通 Cboe 报价 IV(app/metrics.py), 只补两个标记列。"""
     return metrics.with_solved_iv(frame, metrics.DEFAULT_PRICING, ticker=selected_ticker)
 
 
 latest_df = with_our_iv(db.get_latest_snapshot(conn, selected_ticker, source=page_source))
 
-# HOW OLD THIS SCREEN IS, SAID BEFORE ANY OF IT IS DRAWN. Two questions, asked
-# in this order because the answers rule each other out: is this ticker's
-# collection healthy, and — only if there is nothing to report about it — what
-# is the market doing.
-#
-# The freshness note speaks about THIS symbol and wins, because "collection for
-# GLD is failing" is a fact about the screen being read, while "market closed"
-# is a fact about the day. Saying both would print two lines that agree in tone
-# and disagree in meaning, and a reader picks the calmer one.
-#
-# The app never asks the provider itself: a page render has no business making a
-# network call, and two processes asking separately would eventually disagree in
-# front of the reader. Both of these read what the collector already wrote.
 _collector_interval = max(db.get_collector_interval(conn), 15)
 _last_success, _failures = db.collection_state(conn, selected_ticker, source=page_source)
 _freshness = freshness.assess(_last_success, _failures, _collector_interval)
-
 if _freshness:
     _state, _note = _freshness
     if _state == freshness.RESTING:
         st.caption(_note)
     else:
-        # STALE and FAILING are the two the eye must not slide past, so they
-        # keep the banner. RESTING is the market being shut, and a warning
-        # there is the product crying wolf every weekend.
         st.warning(_note, icon="⚠️")
-else:
-    # What the collector last believed about the market, phrased by the
-    # calendar. Only reached when this ticker has nothing wrong with it.
-    _market_note = market_calendar.status_note(
-        db.get_setting(conn, "market_state"),
-        db.get_setting(conn, "market_state_at"),
-        _collector_interval,
-    )
-    if _market_note:
-        st.caption(_market_note)
-
-# A SYMBOL THIS SOURCE WILL NOT SERVE, said before anything else on the page.
-# Without it the screen is indistinguishable from a ticker that has simply not
-# been collected yet — and the person looking at it typed a symbol they know is
-# real, so "no data, click Collect" reads as the product being broken. The
-# substitute comes from the provider, so it is right by construction rather
-# than by a list somebody has to remember to update.
-_refused_here = getattr(providers.get_provider(), "unsupported_symbols", {}) or {}
-if selected_ticker in _refused_here:
-    st.error(
-        suggestions.source_refusal(
-            selected_ticker, _refused_here[selected_ticker], providers.get_provider().name
-        ),
-        icon="⛔",
-    )
 
 if latest_df.empty:
-    # NOT "click Collect data" WHEN COLLECTING IS THE THING THAT IS FAILING.
-    # The note above already said the source has refused this symbol several
-    # times; inviting somebody to press the button again directly underneath it
-    # is the product contradicting itself in two consecutive lines, and the
-    # press costs another refused request.
-    if not (_freshness and _freshness[0] == freshness.FAILING):
-        st.info(f"No data for {selected_ticker}. Click “Collect data” on the left.")
+    st.info(f"{selected_ticker} 还没有数据(等 gg-ingest)。")
     st.stop()
 
-# Said out loud only when there is something to say. A person who switched
-# providers sees their older history disappear from the charts, and hidden
-# history with no explanation is indistinguishable from data loss.
-_ticker_sources = db.sources_for(conn, selected_ticker) if page_source else []
-if len(_ticker_sources) > 1:
-    others = ", ".join(s for s in _ticker_sources if s != page_source)
-    st.caption(
-        f"Showing data from **{page_source}**. This ticker also has history from {others}, "
-        "which is kept but not shown: two providers calculate implied volatility "
-        "differently, so mixing them on one chart would draw moves that never happened."
-    )
-
 latest_date = latest_df["collected_at"].max()
+spot_latest = float(latest_df["underlying_price"].iloc[0])
 expiries = sorted(latest_df["expiry"].unique())
 
-# Deliberately not st.tabs. Streamlit has no lazy tabs: the body of every
-# `with tab_x:` runs on every rerun and the browser merely hides the seven you
-# are not looking at, so each interaction pays for eight views to show one.
-# Measured on a realistically-shaped chain (3,520 contracts per snapshot), one
-# render is 1.3-1.7s — and tripling the stored rows barely moved that, which
-# says the cost is the tabs, not the data, and will not improve on its own.
-#
-# The trade this makes, stated plainly: switching views used to be instant
-# (everything was already in the browser) and now costs one script run. That
-# run renders a single view, so it is a fraction of what every interaction used
-# to cost.
-# Pinned contracts are needed by two views — the Contract tab and the contract
-# card the Screener opens on a row click. This used to be fetched inside the
-# Contract tab's body and read from the Screener's, which worked only because
-# st.tabs executed every tab on every run. With one view rendering at a time
-# that is a NameError on the Screener, reachable only after clicking a row —
-# the sibling project shipped exactly that and a user found it in the browser.
+_weather = metrics.gamma_weather(latest_df)
+if _weather:
+    st.markdown(weather.panel(_weather, latest_moment=latest_date), unsafe_allow_html=True)
+render_mb_strip(_mb_latest_read(selected_ticker))
+
 _tracked_cache: dict[str, pd.DataFrame] = {}
 
 
@@ -981,67 +387,29 @@ def get_tracked() -> pd.DataFrame:
     return _tracked_cache["df"]
 
 
-# WHAT THE WHOLE CHAIN ADDS UP TO, IN ONE LINE, ABOVE EVERY VIEW. Eight views
-# answer eight questions and none of them answers the first one somebody has:
-# is dealer hedging damping this or amplifying it today. The number that says
-# so is net GEX, which is eight digits and a sign — and the sign is the part
-# that matters, which no amount of staring at the digits teaches.
-#
-# BUILT ONCE, FROM THE SNAPSHOT ALREADY IN HAND. It folds one GEX matrix over
-# the near-term expiries and reads three numbers off it, so drawing it on every
-# view costs one matrix rather than one per view. The near term rather than the
-# whole chain, on purpose: read over every expiry it would disagree with the
-# heatmap directly below it on any symbol whose open interest sits far out.
-_weather = metrics.gamma_weather(latest_df)
-if _weather:
-    st.markdown(weather.panel(_weather, latest_moment=latest_date), unsafe_allow_html=True)
-
-VIEWS = [
-    "Overview", "Changes", "Max Pain / GEX", "GEX Heatmap", "Volatility (IV)",
-    "Contract", "Screener", "Unusual Activity", "OI Delta",
-]
-active_view = st.segmented_control(
-    "View", VIEWS, default=VIEWS[0], key="active_view", label_visibility="collapsed"
-)
-# A segmented control returns None when the current pill is deselected; an
-# empty page is never what that gesture means here.
+VIEWS = ["概览", "较昨日", "Max Pain / GEX", "GEX 热图", "波动率", "单合约", "筛选器", "异常成交", "OI 变化"]
+active_view = st.segmented_control("视图", VIEWS, default=VIEWS[0], key="active_view", label_visibility="collapsed")
 active_view = active_view or VIEWS[0]
 
-if active_view == "Overview":
-    st.subheader("Overview")
-    st.caption(f"Data for {selected_ticker} collected {format_datetime(latest_date)}")
-    st.subheader("Put/Call Ratio")
-    # Aggregated in SQL rather than by grouping every raw row here: same
-    # numbers, a fraction of the work. metrics.put_call_ratio remains the
-    # definition of the ratio and the oracle the tests check this against.
+if active_view == "概览":
+    st.subheader("概览")
+    st.caption(f"{selected_ticker} 最新一班: Cboe 报价时刻 {format_datetime(latest_date)}")
+    st.subheader("Put/Call 比")
     pcr = db.get_put_call_ratio(conn, selected_ticker, days=history_days, source=page_source)
-    st.line_chart(with_viewer_index(pcr)[["pcr_volume", "pcr_oi"]], color=[BRAND_PURPLE, BRAND_GREEN])
-    with st.expander("ℹ️ How to read this"):
+    st.line_chart(with_viewer_index(pcr)[["pcr_volume", "pcr_oi"]], color=[theme.PRIMARY, theme.ACCENT])
+    with st.expander("ℹ️ 怎么读"):
         st.write(
-            "The ratio of put to call volume/open interest. A value noticeably above "
-            "0.7–1.0 usually signals a defensive/bearish stance, below — a bullish one. "
-            "The absolute level matters less than a sharp deviation from the ticker's own "
-            "history on this chart — compare the current value to past ones, not to "
-            "general rules of thumb."
+            "put 与 call 的成交量比(pcr_volume)与未平仓量比(pcr_oi), 每班一点。绝对水平不如它相对自己历史的偏离有用: "
+            "与这张图上过去的值比, 别套通用经验值。"
         )
 
-    st.subheader("Volatility surface (IV surface)")
+    st.subheader("波动率曲面(IV surface)")
     iv_surface_points = metrics.iv_surface(latest_df)
     iv_grid = metrics.iv_surface_grid(iv_surface_points)
     if iv_grid is None:
-        st.info(
-            "Not enough data for a volatility surface — need at least 2 distinct strikes "
-            "and 2 distinct expiries with known IV in the latest snapshot."
-        )
+        st.info("最新一班的数据不够画曲面(至少要两个行权价 × 两个到期日有 IV)。")
     else:
         grid_strikes, grid_years, grid_iv = iv_grid
-
-        # The grid is built by linear interpolation — its x/y nodes (strike,
-        # years) almost never coincide with actually traded contracts, and the
-        # default tooltip would show meaningless fractional values. customdata
-        # swaps them for practically useful ones: the nearest real strike from
-        # the source points and DTE in days (years exist only for the
-        # interpolation math — they're awkward to read).
         real_strikes = np.sort(iv_surface_points["strike"].unique())
         nearest_strike_per_col = np.array(
             [f"{real_strikes[np.abs(real_strikes - gx).argmin()]:g}" for gx in grid_strikes]
@@ -1051,126 +419,53 @@ if active_view == "Overview":
             np.tile(nearest_strike_per_col, (len(grid_years), 1)),
             np.tile(dte_per_row.reshape(-1, 1), (1, len(grid_strikes))),
         ])
-
-        fig = go.Figure(
-            data=[
-                go.Surface(
-                    x=grid_strikes,
-                    y=grid_years,
-                    z=grid_iv,
-                    colorscale="Viridis",
-                    customdata=customdata,
-                    hovertemplate=(
-                        "Strike ≈ %{customdata[0]}<br>"
-                        "DTE: %{customdata[1]} d<br>"
-                        "IV: %{z:.2f}<extra></extra>"
-                    ),
-                )
-            ]
-        )
-        # The Y axis stays continuous in years-to-expiry — otherwise the
-        # interpolation between expiries (uneven spacing, differing strike
-        # counts) would make no sense. But its tick labels are the real expiry
-        # dates rather than abstract fractions of a year: years exist for the
-        # math, not for reading.
+        fig = go.Figure(data=[go.Surface(
+            x=grid_strikes, y=grid_years, z=grid_iv, colorscale="Viridis", customdata=customdata,
+            hovertemplate="行权价 ≈ %{customdata[0]}<br>DTE: %{customdata[1]} 天<br>IV: %{z:.2f}<extra></extra>",
+        )])
         expiry_ticks = (
-            iv_surface_points[["years_to_expiry", "expiry"]]
-            .drop_duplicates()
-            .sort_values("years_to_expiry")
+            iv_surface_points[["years_to_expiry", "expiry"]].drop_duplicates().sort_values("years_to_expiry")
         )
         fig.update_layout(
             scene={
-                "xaxis_title": "Strike",
-                "yaxis": {
-                    "title": "Expiry",
-                    "tickmode": "array",
-                    "tickvals": expiry_ticks["years_to_expiry"].tolist(),
-                    "ticktext": [format_date(d) for d in expiry_ticks["expiry"]],
-                },
+                "xaxis_title": "行权价",
+                "yaxis": {"title": "到期日", "tickmode": "array",
+                          "tickvals": expiry_ticks["years_to_expiry"].tolist(),
+                          "ticktext": [format_date(d) for d in expiry_ticks["expiry"]]},
                 "zaxis_title": "IV",
             },
-            margin={"l": 0, "r": 0, "t": 10, "b": 0},
-            height=500,
+            margin={"l": 0, "r": 0, "t": 10, "b": 0}, height=500,
+            paper_bgcolor=theme.SURFACE, font={"color": theme.TEXT},
         )
         st.plotly_chart(fig, use_container_width=True)
-        with st.expander("ℹ️ How to read this"):
+        with st.expander("ℹ️ 怎么读"):
             st.write(
-                "The implied volatility surface across the whole chain at the latest "
-                "snapshot: strike on one axis, expiry date on the other, height/color — the "
-                "IV itself. For each strike the OTM contract's IV is used (put below the "
-                "current underlying price, call above): ITM contracts' IV is usually less "
-                "reliable due to low liquidity and wide spreads.\n\n"
-                "Real strikes and expiries rarely fall on a regular grid (different expiries "
-                "have different strike spacing and ranges, far dates are coarser), so the "
-                "surface is filled in by linear interpolation between the actual points (and "
-                "at the edges, where interpolation runs out of data, by nearest neighbor) to "
-                "avoid gaps/holes. This is display smoothing only, not new data — the source "
-                "points remain the app's own snapshots, with no calls to external sources. "
-                "Because of the interpolation, a grid node under the cursor almost never "
-                "matches an actually traded contract — the tooltip shows the nearest real "
-                "strike and DTE in days rather than the interpolated values.\n\n"
-                "The typical shape is a \"smile\" or a skew across strikes at each expiry "
-                "(see the Volatility (IV) tab for a single-expiry slice) and a rising/falling "
-                "overall IV level as expiry moves further out (term structure). Sharp local "
-                "spikes on the surface usually indicate sparse data in that region rather "
-                "than a real market effect — trust the overall shape more than individual "
-                "bumps."
+                "最新一班整条链的 IV: 一轴行权价, 一轴到期日, 高度 / 颜色是 IV 本身(每个行权价取 OTM 那一侧: 现价下方取 put, "
+                "上方取 call)。真实的行权价与到期日不落在规则网格上, 曲面是在实际点之间线性插值填出来的(边缘取最近邻), "
+                "只是显示平滑, 不是新数据 —— 所以光标下的格点几乎不对应真实合约, 悬停读数给的是最近的真实行权价与 DTE。"
+                "局部尖刺多半是那一带数据稀, 看整体形状别看单个凸起。IV 是 Cboe 报价 IV(小数, 0.18 = 18%)。"
             )
 
-    # THE PRICE CHART LAST, AND ONLY HERE. It used to sit above the view
-    # switcher, which meant every one of the nine views paid for an embedded
-    # third-party widget — 450 pixels and an outside request — to show the
-    # same line, on screens that are about the option chain rather than the
-    # underlying. The hosted product keeps it at the foot of Overview for the
-    # same reason, and this is where somebody actually looks for it.
-    st.subheader("Underlying price")
-    components.html(render_tradingview_widget(selected_ticker, height=450), height=450)
 
-
-if active_view == "Changes":
-    # WHAT THIS VIEW IS FOR. Every other view answers a question about now, and
-    # the one thing this tool has that a web page of today's numbers does not
-    # is that it kept yesterday. This is the view that says so: two trading
-    # days side by side, and what moved between them.
+if active_view == "较昨日":
     _days = db.list_day_summaries(conn, selected_ticker, page_source) if page_source else []
     if len(_days) < 1:
-        st.info(
-            "No day summaries yet for this ticker. One is written after every collection, "
-            "and the worker fills in the days it missed — so this view fills itself in as "
-            "collection runs."
-        )
+        st.info("还没有日行: 每班入库后写一行, 回放跑完就有。")
     else:
-        # The pickers offer days that EXIST rather than a calendar: a date with
-        # no collection behind it is not a comparison, and offering it invites
-        # somebody to pick it and read an error as a defect.
         _default_after = _days[0]
         _default_before = _days[1] if len(_days) > 1 else _days[0]
         left, right = st.columns(2)
-        day_before = left.selectbox(
-            "Compare from", _days, index=_days.index(_default_before), key="changes_from",
-            format_func=format_date,
-        )
-        day_after = right.selectbox(
-            "to", _days, index=_days.index(_default_after), key="changes_to",
-            format_func=format_date,
-        )
+        day_before = left.selectbox("从", _days, index=_days.index(_default_before), key="changes_from", format_func=format_date)
+        day_after = right.selectbox("到", _days, index=_days.index(_default_after), key="changes_to", format_func=format_date)
         row_after = db.get_day_summary(conn, selected_ticker, page_source, day_after)
-        row_before = (
-            db.get_day_summary(conn, selected_ticker, page_source, day_before)
-            if day_before != day_after else None
-        )
+        row_before = db.get_day_summary(conn, selected_ticker, page_source, day_before) if day_before != day_after else None
         if row_after is None:
-            st.info("That day has no summary row.")
+            st.info("那一天没有日行。")
         else:
-            # The flow numbers live in the day row; the volatility average
-            # lives with the collection moment it was computed for. Joined here
-            # rather than stored twice.
             def _rollup(row):
                 if row is None:
                     return None
-                stored = db.get_moment_rollup(
-                    conn, selected_ticker, page_source, row["collected_at"]
-                ) or {}
+                stored = db.get_moment_rollup(conn, selected_ticker, page_source, row["collected_at"]) or {}
                 return {
                     "iv_weighted_avg": stored.get("iv_weighted_avg"),
                     "call_volume": row.get("call_volume"), "put_volume": row.get("put_volume"),
@@ -1179,42 +474,24 @@ if active_view == "Changes":
 
             rollup_after = _rollup(row_after)
             rollup_before = _rollup(row_before)
-            # Yesterday's max pain for TODAY's nearest expiry, on the day the
-            # nearest expiry rolls over. Without it the line claims a brand new
-            # level, which is the chain being read through a different expiry
-            # rather than anything having happened.
             same_expiry_pain = None
-            if (
-                row_before
-                and row_after.get("nearest_expiry")
-                and str(row_before.get("nearest_expiry")) != str(row_after.get("nearest_expiry"))
-            ):
-                earlier = db.get_snapshots_at(
-                    conn, selected_ticker, [row_before["collected_at"]], source=page_source
-                )
+            if (row_before and row_after.get("nearest_expiry")
+                    and str(row_before.get("nearest_expiry")) != str(row_after.get("nearest_expiry"))):
+                earlier = db.get_snapshots_at(conn, selected_ticker, [row_before["collected_at"]], source=page_source)
                 if not earlier.empty:
                     wanted = pd.Timestamp(row_after["nearest_expiry"])
-                    same_day = earlier[
-                        pd.to_datetime(earlier["expiry"], errors="coerce") == wanted
-                    ]
+                    same_day = earlier[pd.to_datetime(earlier["expiry"], errors="coerce") == wanted]
                     if not same_day.empty:
                         pain = metrics.max_pain(same_day, wanted)
                         same_expiry_pain = None if pain is None or pd.isna(pain) else float(pain)
 
-            ladder = day_summary.changes(
-                row_before, row_after, rollup_before, rollup_after, same_expiry_pain
-            )
+            ladder = day_summary.changes(row_before, row_after, rollup_before, rollup_after, same_expiry_pain)
             st.subheader(day_summary.headline(ladder))
             st.caption(
                 f"{format_date(day_before)} → {format_date(day_after)}"
-                + ("" if row_before else "  ·  first day on record — nothing to compare yet")
+                + ("" if row_before else "  ·  第一天, 还没有可比的")
+                + f"  ·  每天取那天最后一班(美东日期)  ·  净 GEX {GEX_UNIT}, 近月窗口(与上方状态句同一口径)"
             )
-
-            # One HTML table rather than a dataframe: the chips carry meaning
-            # in colour (green towards damping, purple towards amplification —
-            # what those two colours mean on every other chart here), and a
-            # plain table of numbers is exactly the thing this view exists to
-            # not be.
             rows_html = []
             for line in ladder:
                 tone = ""
@@ -1226,13 +503,11 @@ if active_view == "Changes":
                 if line["key"] == "expiries":
                     parts = []
                     if line.get("rolled_off"):
-                        parts.append("expired: " + ", ".join(line["rolled_off"]))
+                        parts.append("已到期: " + ", ".join(line["rolled_off"]))
                     if line.get("listed"):
-                        parts.append("newly listed: " + ", ".join(line["listed"]))
+                        parts.append("新挂牌: " + ", ".join(line["listed"]))
                     note = note or "; ".join(parts)
-                label = line["label"] + (
-                    f'<span class="gg-note">{note}</span>' if note else ""
-                )
+                label = line["label"] + (f'<span class="gg-note">{note}</span>' if note else "")
                 rows_html.append(
                     f"<tr><td>{label}</td>"
                     f'<td class="gg-num gg-before">{day_summary.format_value(line, "before")}</td>'
@@ -1241,434 +516,199 @@ if active_view == "Changes":
                 )
             st.markdown(
                 '<table class="gg-ladder"><tr><th></th>'
-                f"<th>{format_date(day_before)}</th>"
-                f"<th>{format_date(day_after)}</th>"
-                "<th>change</th></tr>"
+                f"<th>{format_date(day_before)}</th><th>{format_date(day_after)}</th><th>变化</th></tr>"
                 + "".join(rows_html) + "</table>",
                 unsafe_allow_html=True,
             )
-
-            # The two GEX profiles on one chart: the day before as an outline,
-            # the day after filled. The window is the strikes around the money,
-            # the same band the heatmap draws, because the far tails are where
-            # a profile carries nothing and a chart drawn over them shows two
-            # flat lines meeting in the middle.
             profile_after = row_after.get("gex_by_strike") or []
             if profile_after:
-                st.subheader("GEX profile, both days")
-                frame = pd.DataFrame({format_date(day_after): dict(profile_after)})
+                st.subheader(f"两天的 GEX 剖面(近月窗口, {GEX_UNIT})")
+                frame = pd.DataFrame({format_date(day_after): {
+                    k: per_pct(v, row_after["underlying_price"]) for k, v in dict(profile_after).items()}})
                 if row_before and row_before.get("gex_by_strike"):
-                    frame[format_date(day_before)] = pd.Series(
-                        dict(row_before["gex_by_strike"])
-                    )
+                    frame[format_date(day_before)] = pd.Series({
+                        k: per_pct(v, row_before["underlying_price"]) for k, v in dict(row_before["gex_by_strike"]).items()})
                 frame = frame.sort_index()
                 frame.index.name = "strike"
                 frame = strikes_around_money(frame, row_after["underlying_price"], 20)
-                # NOT STACKED. Stacked bars would draw one day ON TOP of the
-                # other, so a strike where both days carry exposure would read
-                # as their sum — a wall twice the size of either day's.
-                st.bar_chart(
-                    frame, stack=False,
-                    color=[BRAND_GREEN, BRAND_PURPLE][: len(frame.columns)],
-                )
-
-            with st.expander("ℹ️ How to read this"):
+                st.bar_chart(frame, stack=False, color=[theme.ACCENT, theme.PRIMARY][: len(frame.columns)])
+            with st.expander("ℹ️ 怎么读"):
                 st.write(
-                    "Two trading days of your own collection, side by side. A day is New "
-                    "York's date, and the row describes that day's last collection — the "
-                    "same rule OI Delta uses, so the two views never disagree about what "
-                    "\"yesterday\" means.\n\n"
-                    "Colour is reserved for the regime: green when the day moved towards "
-                    "dealer hedging damping moves, purple when it moved towards amplifying "
-                    "them. Everything else changed without changing what kind of day it "
-                    "is, so it is printed in plain ink.\n\n"
-                    "Levels are reported in strikes because that is the grid they live on: "
-                    "a wall that moved \"+1 strike\" moved to the next listed strike, which "
-                    "is a fact about this chain, while the same move as a percentage is a "
-                    "fact about nothing. Max pain is compared for the same expiry only — "
-                    "when the nearest expiry rolls over, the line says which one was "
-                    "nearest before."
+                    "两个交易日并排。「一天」= 美东日期那天最后一班采集, 与 OI 变化同一规则。颜色只给状态: 绿 = 往「对冲流抑制」"
+                    "那边动, 红 = 往「放大」那边动, 其余变动用素色。位置用「几档」说(一档 = 这条链相邻两个行权价的间距); "
+                    "Max Pain 只在同一到期日之间比, 最近到期日换了就注明换前是哪个。"
                 )
 
 
 if active_view == "Max Pain / GEX":
-    # Most tickers list an expiry for today, and it sorts first — so the
-    # default landed on the one expiry whose gamma is zero by definition, and
-    # the GEX chart came up empty under a "Net GEX: 0" banner while Max Pain
-    # right above it showed a number (it needs only open interest). Default to
-    # the first expiry that still has time left instead; the others stay in the
-    # list, labelled, because looking at them is legitimate.
     has_time_left = [e for e in expiries if metrics.years_to_expiry(e, latest_date) > 0]
     default_expiry_index = expiries.index(has_time_left[0]) if has_time_left else 0
 
     def format_gex_expiry(expiry) -> str:
         if metrics.years_to_expiry(expiry, latest_date) > 0:
             return format_date(expiry)
-        return f"{format_date(expiry)}  ⚠️ no gamma left"
+        return f"{format_date(expiry)}  ⚠️ 已无 gamma"
 
     selected_expiry = st.selectbox(
-        "Expiry", expiries, index=default_expiry_index, format_func=format_gex_expiry,
-        # Keyed by ticker: a widget value outlives a rerun, so without this the
-        # expiry picked for the previous ticker carries over, and if the new
-        # ticker doesn't trade that date every chart below filters to nothing.
-        key=f"expiry_pain_gex_{selected_ticker}",
+        "到期日", expiries, index=default_expiry_index, format_func=format_gex_expiry, key=f"expiry_pain_gex_{selected_ticker}",
     )
     years_left = metrics.years_to_expiry(selected_expiry, latest_date)
 
     st.subheader("Max Pain")
     mp = metrics.max_pain(latest_df, selected_expiry)
-    st.metric("Max Pain strike", mp if mp is not None else "n/a")
-    with st.expander("ℹ️ How to read this"):
-        st.write(
-            "The strike at which total payouts by option sellers are minimal. The price at "
-            "expiration statistically gravitates toward this level, since market makers "
-            "prefer to close the maximum number of contracts without payouts — the effect "
-            "strengthens closer to the expiry date. It is not a guaranteed forecast but a "
-            "tendency that fundamental news can override."
-        )
+    st.metric("Max Pain 行权价", mp if mp is not None else "n/a")
+    with st.expander("ℹ️ 怎么读"):
+        st.write("期权卖方总赔付最小的行权价。到期前价格有向它靠拢的倾向, 越近到期越明显; 是倾向不是预测, 基本面消息会压过它。")
 
-    st.subheader("Approximate Gamma Exposure (GEX)")
+    st.subheader(f"近似 GEX 剖面(BS 口径, {GEX_UNIT})")
     gex = metrics.gamma_exposure_profile(latest_df, selected_expiry)
     if years_left <= 0:
-        # Say why, instead of drawing a flat line at zero. Gamma is undefined
-        # once there is no time left, so this is a property of the contract,
-        # not a gap in the data — which is also why Max Pain above still shows
-        # a number: it is computed from open interest alone.
-        st.info(
-            f"⚠️ This expiry ({format_date(selected_expiry)}) has no time left as of the "
-            f"latest collection ({format_datetime(latest_date)}), so gamma — and therefore "
-            "GEX — is zero by definition, not missing. Pick a later expiry to see a profile."
-        )
+        st.info(f"这个到期日({format_date(selected_expiry)})在最新一班({format_datetime(latest_date)})已无剩余时间, gamma 按定义为零, 不是缺数据。")
     elif not gex.empty:
+        gex = gex.assign(gex=gex["gex"] * spot_latest / 100)
         net_gex = metrics.net_gamma_exposure(gex)
         if net_gex >= 0:
-            st.success(f"Net GEX: {net_gex:,.0f} — positive gamma: dealers dampen price moves")
+            st.success(f"净 GEX {weather.format_gex(net_gex)}(每 1%) —— 正 gamma: 对冲流倾向抑制波动")
         else:
-            st.warning(f"Net GEX: {net_gex:,.0f} — negative gamma: dealers amplify price moves")
-        # Colored by sign (green/purple), matching the same diverging language
-        # as the GEX Heatmap — st.bar_chart can't condition color on a row's
-        # own value, so this one chart uses Altair directly instead of the
-        # thin st.bar_chart wrapper.
-        gex_chart_data = gex.assign(sign=np.where(gex["gex"] >= 0, "Positive", "Negative"))
+            st.warning(f"净 GEX {weather.format_gex(net_gex)}(每 1%) —— 负 gamma: 对冲流倾向放大波动")
+        gex_chart_data = gex.assign(sign=np.where(gex["gex"] >= 0, "正", "负"))
         st.altair_chart(
-            alt.Chart(gex_chart_data)
-            .mark_bar()
-            .encode(
-                x=alt.X("strike:O", title="Strike"),
-                y=alt.Y("gex:Q", title="GEX"),
-                color=alt.Color(
-                    "sign:N",
-                    scale=alt.Scale(domain=["Positive", "Negative"], range=[BRAND_GREEN, BRAND_PURPLE]),
-                    legend=None,
-                ),
+            alt.Chart(gex_chart_data).mark_bar().encode(
+                x=alt.X("strike:O", title="行权价"),
+                y=alt.Y("gex:Q", title=f"GEX({GEX_UNIT})"),
+                color=alt.Color("sign:N", scale=alt.Scale(domain=["正", "负"], range=[theme.ACCENT, theme.PRIMARY]), legend=None),
             ),
             use_container_width=True,
         )
     else:
-        st.info("No data to compute GEX for the selected expiry.")
-    st.caption(
-        "Estimated via the Black-Scholes formula and a sign heuristic (puts contribute "
-        "negatively). Does not reflect actual market-maker positioning — an approximation only."
-    )
-    with st.expander("ℹ️ How to read this"):
-        st.write(
-            "Positive total gamma — the market as a whole is more \"sticky\", range-bound: "
-            "dealer hedging dampens sharp moves. Negative — moves can accelerate, since "
-            "hedging works in the same direction as the trend. On the by-strike chart, the "
-            "largest bars by magnitude often become support/resistance levels created by "
-            "hedging flows, especially closer to the expiry date."
-        )
+        st.info("这个到期日没有可算 GEX 的数据。")
+    st.caption("Black-Scholes 用 Cboe 报价 IV 反算 gamma, 符号用「Call 记正、Put 记负」的朴素假设; 不是做市商真实头寸, 只是近似。")
+    with st.expander("ℹ️ 怎么读"):
+        st.write("总 gamma 为正 —— 市场偏「粘」, 对冲流抑制大幅波动; 为负 —— 对冲与趋势同向, 波动可能加速。按行权价看, 绝对值最大的几根常成为对冲流造出的支撑 / 阻力, 越近到期越明显。")
 
-if active_view == "GEX Heatmap":
-    st.subheader("GEX Heatmap: strike × expiry")
-
-    # From the run log rather than DISTINCT over the snapshots: the collector
-    # writes one timestamp per pass into both, and the log has one row per pass
-    # against one row per contract per pass.
+if active_view == "GEX 热图":
+    st.subheader(f"GEX 热图: 行权价 × 到期日({GEX_UNIT})")
     snapshot_dates = [
         pd.Timestamp(moment)
         for moment in db.get_collection_moments(conn, selected_ticker, days=history_days, source=page_source)
     ] or [pd.Timestamp(latest_date)]
-    as_of = st.selectbox(
-        "Snapshot (Replay — collection history, no auto-refresh)",
-        snapshot_dates,
-        format_func=format_datetime,
-        key="heatmap_as_of",
-    )
+    as_of = st.selectbox("哪一班(回放历史, 不自动刷新)", snapshot_dates, format_func=format_datetime, key="heatmap_as_of")
     is_latest = as_of == snapshot_dates[0]
-    st.caption("Latest snapshot (current state)" if is_latest else "Historical snapshot — Replay mode")
+    st.caption("最新一班(当前状态)" if is_latest else "历史快照 —— 回放")
 
-    # The chosen moment's chain, fetched by equality on collected_at. Everything
-    # this view draws — the matrix, the walls, the flip, per-expiry net GEX — is
-    # a function of one moment, and every metric below already takes `as_of`.
-    snapshot_df = with_our_iv(
-        db.get_snapshots_at(conn, selected_ticker, [as_of], source=page_source)
-    )
+    snapshot_df = with_our_iv(db.get_snapshots_at(conn, selected_ticker, [as_of], source=page_source))
     if snapshot_df.empty:
-        # The run log is a superset of the data: a pass can be recorded as a
-        # success and still have left nothing for this ticker. Before the list
-        # came from the log, `as_of` came from the rows themselves and could
-        # not miss.
-        st.info("That collection is in the log but stored no rows — pick another moment.")
+        st.info("入库记录里有这一班, 但没有行 —— 换一班。")
         st.stop()
-
-    # Expiries with no time left are dropped rather than shown as a column of
-    # exact zeros: gamma is undefined there, and unlike the GEX tab a heatmap
-    # has nowhere to explain why one column is blank. Deliberately NOT st.stop()
-    # when none are left — this runs inside `with tab_heatmap:`, and st.stop()
-    # ends the entire script run, taking every tab below it with it.
-    all_expiries_at_snapshot = [
-        e for e in sorted(snapshot_df["expiry"].unique())
-        if metrics.years_to_expiry(e, as_of) > 0
-    ]
-    spot_at_snapshot = snapshot_df["underlying_price"].iloc[0]
+    all_expiries_at_snapshot = [e for e in sorted(snapshot_df["expiry"].unique()) if metrics.years_to_expiry(e, as_of) > 0]
+    spot_at_snapshot = float(snapshot_df["underlying_price"].iloc[0])
 
     if not all_expiries_at_snapshot:
-        st.info(
-            "Every expiry in this snapshot has already stopped trading, so the whole "
-            "matrix would be zero by definition. Pick a more recent snapshot above."
-        )
+        st.info("这一班的每个到期日都已停止交易, 整张矩阵按定义全零。换一班。")
         matrix_full = pd.DataFrame()
         shown_expiries = []
         strikes_each_side = 10
     else:
         col_n, col_band = st.columns(2)
-        # A slider needs min < max: with exactly one expiry to show, st.slider
-        # raises instead of rendering a fixed handle. Found by rendering the
-        # page for a ticker that trades a single expiry — thin tickers really
-        # do look like this, and it took out the whole tab.
         if len(all_expiries_at_snapshot) > 1:
             n_expiries = col_n.slider(
-                "Nearest expiries",
-                1,
-                len(all_expiries_at_snapshot),
-                min(10, len(all_expiries_at_snapshot)),
-                # Keyed by ticker: the upper bound is the number of expiries,
-                # which differs per ticker, so a carried-over value can fall
-                # outside the range and raise rather than merely render oddly.
+                "最近几个到期日", 1, len(all_expiries_at_snapshot), min(10, len(all_expiries_at_snapshot)),
                 key=f"heatmap_n_expiries_{selected_ticker}",
             )
         else:
             n_expiries = 1
-            col_n.caption("Nearest expiries: 1 (the only one still trading)")
-        # COUNTED IN STRIKES, NOT IN PERCENT. The
-        # control asked for ±% until this day, and a percentage is a different
-        # request on every chain: ±5% is 8 strikes on MO, 77 on SPY, 154 on SPX
-        # — dense enough that the 45-row window below it silently overrode
-        # whatever the slider said, on the two most-watched symbols there are.
-        # A count means the same thing on every chain and keeps the money in
-        # the middle of the table by construction.
+            col_n.caption("最近到期日: 1(唯一还在交易的)")
         strikes_each_side = col_band.slider(
-            "Strikes each side of the money", 5, 100, 10, key="heatmap_strikes_each_side",
-            help=(
-                "How many strikes above and below the strike closest to the underlying "
-                "price to draw. 10 shows 21 rows."
-            ),
+            "现价上下各几档", 5, 100, 10, key="heatmap_strikes_each_side", help="离现价最近的行权价上下各画几档; 10 = 21 行。",
         )
         shown_expiries = all_expiries_at_snapshot[:n_expiries]
         matrix_full = metrics.gex_matrix(snapshot_df, as_of=as_of, expiries=shown_expiries)
 
     if matrix_full.empty:
-        st.info("No data to build the heatmap for the selected snapshot.")
+        st.info("这一班没有可画的数据。")
     else:
-        matrix_band = strikes_around_money(matrix_full, spot_at_snapshot, strikes_each_side)
-
+        matrix_pct = matrix_full * (spot_at_snapshot / 100)
+        matrix_band = strikes_around_money(matrix_pct, spot_at_snapshot, strikes_each_side)
         walls = metrics.dealer_walls(snapshot_df, as_of=as_of, expiries=shown_expiries)
-        # BOTH READ OFF THE MATRIX ABOVE instead of pricing the chain again.
-        # `gamma_flip_price` and `net_gex_by_expiry` each rebuilt it
-        # internally, so this screen evaluated the same greeks three times over
-        # — and every slider on it reruns the whole script, so the cost was
-        # paid on each nudge. Measured on the hosted product, whose matrix is
-        # the same function: 854.6 ms to 66.7 ms on a 13,160-contract SPY
-        # chain, and the numbers coming out are bit-for-bit the ones that went
-        # in before (max |Δ| = 0 over 357 × 10 cells of a live chain). The flip
-        # still walks the full strike range rather than the displayed band —
-        # `matrix_full` is the unbanded matrix.
         flip = metrics.gamma_flip_from_matrix(matrix_full, spot_at_snapshot)
-        net_by_expiry = metrics.net_gex_from_matrix(matrix_full, expiries=shown_expiries)
+        net_by_expiry = metrics.net_gex_from_matrix(matrix_pct, expiries=shown_expiries)
         total_net_gex = net_by_expiry["net_gex"].sum()
 
         col_price, col_call, col_put, col_flip, col_zone = st.columns(5)
-        col_price.metric("Underlying price", f"{spot_at_snapshot:,.2f}")
-        col_call.metric("Call Wall", f"{walls['call_wall']:g}" if walls["call_wall"] is not None else "n/a")
-        col_put.metric("Put Wall", f"{walls['put_wall']:g}" if walls["put_wall"] is not None else "n/a")
-        col_flip.metric("Gamma Flip", f"{flip:,.2f}" if flip is not None else "n/a")
-        col_zone.metric("Regime", "Neg" if total_net_gex < 0 else "Pos")
+        col_price.metric("现价", f"{spot_at_snapshot:,.2f}")
+        col_call.metric("Call 墙(OI 最大)", f"{walls['call_wall']:g}" if walls["call_wall"] is not None else "n/a")
+        col_put.metric("Put 墙(OI 最大)", f"{walls['put_wall']:g}" if walls["put_wall"] is not None else "n/a")
+        col_flip.metric("插值翻转价", f"{flip:,.2f}" if flip is not None else "n/a")
+        col_zone.metric("净 GEX · 每 1%", weather.format_gex(total_net_gex))
 
         if matrix_band.empty:
-            st.info("No strikes to show for this snapshot.")
+            st.info("这一班没有可显示的行权价。")
         else:
-            # THE CONTROL DECIDES WHAT IS DRAWN. What used to be
-            # here was a 45-row window around the money, applied AFTER the
-            # control had chosen a percentage band — and it quietly overrode it:
-            # SPY has 77 strikes within ±5% and SPX has 154, so on both, the two
-            # most watched symbols in the product, the slider produced the
-            # identical table at every position from 5% to 50%. A control that
-            # silently ignores its input is worse than no control.
-            #
-            # The count above now IS the window, so there is nothing left to
-            # override it, and the money stays in the middle by construction.
             strikes = matrix_band.index.to_numpy(dtype=float)
             atm_strike = matrix_band.index[np.abs(strikes - spot_at_snapshot).argmin()]
             matrix = matrix_band
-
-            # Expiries that are all zeros within the shown strike range get
-            # dropped: a column without a single nonzero value carries no
-            # information and just widens the table to the right.
             nonzero_cols = matrix.columns[(matrix != 0).any(axis=0)]
             hidden_count = len(matrix.columns) - len(nonzero_cols)
             matrix = matrix[nonzero_cols]
             net_by_expiry_shown = net_by_expiry[net_by_expiry["expiry"].isin(nonzero_cols)]
-
             st.caption(
-                f"Net GEX across {len(nonzero_cols)} of {len(shown_expiries)} shown expiries "
-                f"({len(all_expiries_at_snapshot)} total)"
-                + (f" — {hidden_count} hidden (no activity in this strike range)" if hidden_count else "")
-                + ":"
+                f"显示 {len(shown_expiries)} 个到期日里的 {len(nonzero_cols)} 个(共 {len(all_expiries_at_snapshot)} 个)的逐到期日净 GEX"
+                + (f" —— {hidden_count} 个在此行权价范围内无活动, 已隐藏" if hidden_count else "") + ":"
             )
             net_display = net_by_expiry_shown.assign(
                 expiry=net_by_expiry_shown["expiry"].map(format_date),
                 net_gex=net_by_expiry_shown["net_gex"].map(format_compact),
             )
             st.dataframe(net_display.set_index("expiry").T, use_container_width=True)
-
-            # A viewport, not a filter — the difference this fix is
-            # about. 45 rows is a comfortable screenful; asking for more than
-            # that many strikes costs scrolling inside the table rather than a
-            # page several thousand pixels long.
             viewport_rows = 45
             st.caption(
-                f"{len(matrix)} strikes around the money ({atm_strike:g}, marked “➤”): "
-                f"up to {strikes_each_side} each side"
-                + (" — the table scrolls" if len(matrix) > viewport_rows else "")
+                f"现价附近 {len(matrix)} 档(最近一档 {atm_strike:g}, 标「➤」): 上下各至多 {strikes_each_side} 档"
+                + ("(表内滚动)" if len(matrix) > viewport_rows else "")
             )
-            # Compact row height — without it only ~10 rows fit on screen, and
-            # comparing all strikes required constant scrolling.
             row_height = 24
             table_height = (min(len(matrix), viewport_rows) + 1) * row_height + 3
-            st.dataframe(
-                style_gex_matrix(matrix, atm_strike=atm_strike),
-                use_container_width=True,
-                height=table_height,
-                row_height=row_height,
-            )
+            st.dataframe(style_gex_matrix(matrix, atm_strike=atm_strike), use_container_width=True, height=table_height, row_height=row_height)
 
-        with st.expander("ℹ️ How to read this"):
+        with st.expander("ℹ️ 怎么读"):
             st.write(
-                "Each cell is the approximate GEX (Black-Scholes, same sign heuristic as on the "
-                "Max Pain/GEX tab) for a specific strike and expiry, computed on a single "
-                "snapshot — no need to pick expiries one at a time, the whole chain is visible at "
-                "once. Numbers are abbreviated (1.2k = 1,200, 1.5m = 1,500,000) — exact values "
-                "aren't needed for visual comparison, and shorter text leaves more room for "
-                "expiry columns. Green — positive GEX (dealers dampen the move), purple — "
-                "negative (dealers amplify the move), black — near zero. The color scale is "
-                "calibrated to the 90th percentile of values rather than the true maximum — "
-                "otherwise a single strong outlier stretches the scale until every other cell "
-                "becomes nearly indistinguishably washed out; the most extreme values are simply "
-                "painted the limit color, and the exact number is still visible as text. 0 means "
-                "this strike simply has no listing for that expiry (not \"no data\") — that's "
-                "normal: near expiries usually have a tighter range of actual strikes than far "
-                "ones; expiries with no nonzero values at all within the shown strike range are "
-                "hidden from the table entirely. The strike closest to the current underlying "
-                "price is marked “➤” and outlined, and the table shows a strike window "
-                "centered on it.\n\n"
-                "**Call Wall / Put Wall** — the strike with maximum open interest in calls/puts "
-                "respectively, aggregated over the shown expiries — a common proxy for "
-                "support/resistance levels created by dealer hedging flows.\n\n"
-                "**Gamma Flip** — the approximate underlying price at which total GEX across the "
-                "shown expiries flips sign (linear interpolation between the nearest strikes). "
-                "This is not a re-pricing of greeks at hypothetical underlying prices (more "
-                "accurate but noticeably more expensive to compute), but a proxy based on the "
-                "already-computed profile at the current price — the same class of assumption as "
-                "net GEX. **Regime** Neg/Pos — the sign of total net GEX across the shown "
-                "expiries.\n\n"
-                "A ticker can have 20-30+ expiries (including far-dated LEAPS 1-2 years out) "
-                "with very different strike ranges — the full matrix would be mostly empty and "
-                "unreadable. The sliders above limit the view to the nearest N expiries and a "
-                "number of strikes each side of the money; the expiry count also decides which "
-                "subset Call/Put Wall, Gamma Flip, and per-expiry Net GEX are computed over, "
-                "while the strike count is display only — the flip is found over the whole "
-                "strike range. The approximation formulas themselves don't change.\n\n"
-                "The snapshot selector lets you pick an earlier collection from history (Replay) "
-                "and see how the picture looked at that moment — no new data is needed, and "
-                "there is no real-time auto-refresh (collection happens only via the “Collect "
-                "data” button)."
+                f"每格是单一班里某行权价 × 某到期日的近似 GEX({GEX_UNIT}; Black-Scholes 用 Cboe 报价 IV 反算 gamma, 符号同「Max Pain / GEX」), "
+                "数字缩写(1.2k = 1,200, 1.5b = 15 亿)。绿 = 正(倾向抑制), 红 = 负(倾向放大), 近黑 = 接近零; 色阶按 90 分位定, "
+                "极值只涂到上限色, 数字仍照印。0 表示该到期日没挂这个行权价, 不是缺数据。\n\n"
+                "**Call 墙 / Put 墙** —— 在显示的到期日范围内, call / put 各自未平仓量最大的行权价(gammagrid 定义; 晨刊用的是 signed GEX 的极值档, "
+                "两者可能不同, 页头并列的那一行是晨刊的)。\n\n"
+                "**插值翻转价** —— 把显示到期日的 GEX 按行权价累加, 找离现价最近的穿零点, 在相邻两档之间线性插值成价格。不是在假设现价上"
+                "重算整条链(那是 SpotGamma 的 Zero Gamma), 也不是晨刊的「累计穿零档」(±15% 带内升序第一次穿零的行权价, 不插值)。\n\n"
+                "到期日数量决定墙 / 翻转价 / 逐到期日净 GEX 的计算范围; 行权价档数只管显示, 翻转价在全部行权价上找。"
             )
 
-if active_view == "Volatility (IV)":
-    st.subheader("IV: volume-weighted average for the ticker")
-    # From the rollup written at collection time, not aggregated on read: the
-    # answer is one row per collection and the input was one row per contract
-    # per collection. It also stops the chart changing under you as contracts
-    # expire and move to the archive.
+if active_view == "波动率":
+    st.subheader("IV: 成交量加权平均(逐班)")
     iv_avg = db.get_iv_weighted_average(conn, selected_ticker, days=history_days, source=page_source)
-    st.line_chart(with_viewer_index(iv_avg)["iv_weighted_avg"], color=BRAND_PURPLE)
-    # THE ONE PLACE A READER COULD SEE TWO MODELS IN ONE PICTURE. Everything
-    # else on this page is solved as it is drawn, so it is ours all the way
-    # back; this chart is read from a rollup, and every point written before
-    # the release that changed the model holds the data source's number. The
-    # collector rewrites them in the background, newest first, so the line says
-    # what is left rather than warning about something the reader cannot act on
-    # — and it disappears by itself when there is nothing left to say.
-    pending_moments = db.iv_summary_pending(conn, selected_ticker, source=page_source)
-    if pending_moments:
-        st.caption(
-            f"The earliest {pending_moments:,} point(s) of this chart still carry the data "
-            "source's own volatility, from before this product started solving it from the "
-            "contract's price. They are being recomputed in the background while the "
-            "collector runs — nothing to start, and the rest of this page is unaffected."
-        )
-    with st.expander("ℹ️ How to read this"):
-        st.write(
-            "Rising average IV usually precedes an anticipated move (earnings, news) or "
-            "already reflects increased market uncertainty. Falling — the market is calming "
-            "down. Compare the current level against the historical range on this chart, "
-            "not against absolute numbers — \"normal\" IV differs a lot between tickers."
-        )
+    st.line_chart(with_viewer_index(iv_avg)["iv_weighted_avg"], color=theme.PRIMARY)
+    with st.expander("ℹ️ 怎么读"):
+        st.write("整条链按成交量加权的 IV, 每班一点(Cboe 报价 IV)。涨多半是在等一个事件或不确定性抬头, 跌是在平静。与这个标的自己的历史比, 不同标的的「正常」水平差很远。")
 
-    st.subheader("IV: chain slice (latest snapshot)")
-    selected_expiry_iv = st.selectbox(
-        "Expiry", expiries, format_func=format_date, key=f"expiry_iv_skew_{selected_ticker}"
-    )
+    st.subheader("IV: 单一到期日的偏斜(最新一班)")
+    selected_expiry_iv = st.selectbox("到期日", expiries, format_func=format_date, key=f"expiry_iv_skew_{selected_ticker}")
     skew_snapshot = latest_df[latest_df["expiry"] == selected_expiry_iv]
-    skew_pivot = skew_snapshot.pivot_table(
-        index="strike", columns="option_type", values="implied_volatility"
-    )
+    skew_pivot = skew_snapshot.pivot_table(index="strike", columns="option_type", values="implied_volatility")
     if skew_pivot.empty:
-        st.info("No data for this expiry in the latest snapshot.")
+        st.info("最新一班没有这个到期日的数据。")
     else:
-        # A fixed 2-color list crashes (StreamlitColorLengthError, found live
-        # on real illiquid tickers) whenever the latest snapshot for this
-        # expiry only has calls or only puts — pivot_table then produces a
-        # single column, not two. Built to match skew_pivot's actual columns
-        # instead of assuming both are always present.
-        option_type_colors = {"call": BRAND_PURPLE, "put": BRAND_GREEN}
+        option_type_colors = {"call": theme.PRIMARY, "put": theme.ACCENT}
         st.line_chart(skew_pivot, color=[option_type_colors[c] for c in skew_pivot.columns])
-    with st.expander("ℹ️ How to read this"):
-        st.write(
-            "The curve's shape shows which strikes the market prices as riskier (higher "
-            "implied volatility). A steep skew toward puts at low strikes (put skew) "
-            "usually means elevated demand for downside protection — the typical picture "
-            "for most stocks."
-        )
+    with st.expander("ℹ️ 怎么读"):
+        st.write("曲线形状说明市场把哪些行权价定价得更贵(IV 更高)。低行权价一侧的 put 明显更高(put skew)= 下行保护需求高, 这是指数的常态。")
+    st.caption("单份合约的 IV 历史与其余 greeks 在「单合约」视图。")
 
-    st.caption("IV history and the rest of the greeks for a specific contract — on the Contract tab.")
-
-if active_view == "Contract":
-    st.subheader("Contract: price and greeks over time")
-
+if active_view == "单合约":
+    st.subheader("单合约: 价格与 greeks 随时间")
     if not get_tracked().empty:
-        st.caption("Pinned contracts (click a name to show it below):")
+        st.caption("钉住的合约(点一下显示在下面):")
         for _, trow in get_tracked().iterrows():
             col_a, col_b = st.columns([5, 1])
-            label = f"{format_date(trow['expiry'])}  strike {trow['strike']:g}  {trow['option_type']}"
+            label = f"{format_date(trow['expiry'])}  行权价 {trow['strike']:g}  {trow['option_type']}"
             if col_a.button(label, key=f"select_tracked_{trow['id']}", use_container_width=True):
-                # Written before the rerun so the selectors below initialize
-                # with these values. The keys MUST match the ones the selectors
-                # use, ticker suffix included — they were keyed by ticker to stop
-                # one ticker's expiry leaking into another, and this handler kept
-                # writing the old unsuffixed names, so clicking a pinned contract
-                # silently did nothing at all.
                 st.session_state[f"opt_expiry_{selected_ticker}"] = trow["expiry"]
                 st.session_state[f"opt_strike_{selected_ticker}"] = trow["strike"]
                 st.session_state[f"opt_type_{selected_ticker}"] = trow["option_type"]
@@ -1678,112 +718,51 @@ if active_view == "Contract":
                 st.rerun()
         st.divider()
 
-    # EXPIRED CONTRACTS. Their history is stored and perfectly readable; what
-    # they cannot do is appear in these selectors, because the lists are built
-    # from the LATEST snapshot and it has no row for something that no longer
-    # trades. On expiry day a contract simply vanishes from the dropdown — and
-    # if a stale expiry survives in the widget's state, the strike list under it
-    # comes back empty and the page shows a validly selected contract with no
-    # data at all.
-    #
-    # Off by default: on this database 7,098 of 26,894 contracts have already
-    # expired, a ratio that only grows, and always-on would bury the live chain
-    # under the archive.
     expired = db.get_expired_contracts(conn, selected_ticker, source=page_source)
     expired_expiries = []
     if not expired.empty:
-        if st.checkbox(
-            f"Show expired contracts ({len(expired)} with collected history)",
-            key=f"show_expired_{selected_ticker}",
-            help="Contracts that have already expired. Nothing was deleted — they simply "
-                 "cannot appear in these lists on their own, because the lists come from "
-                 "the current chain.",
-        ):
+        if st.checkbox(f"包含已到期合约({len(expired)} 份有历史)", key=f"show_expired_{selected_ticker}",
+                       help="已到期的合约不再出现在最新一班里, 所以默认不在下拉里; 它们的历史都在。"):
             expired_expiries = sorted(pd.Timestamp(e) for e in expired["expiry"].unique())
-
     live_expiries = [pd.Timestamp(e) for e in expiries]
     all_expiries = sorted(set(live_expiries) | set(expired_expiries))
 
     def _format_expiry_option(expiry) -> str:
         label = format_date(expiry)
-        return label if expiry in live_expiries else f"{label}  ⏳ expired"
+        return label if expiry in live_expiries else f"{label}  ⏳ 已到期"
 
     col1, col2, col3 = st.columns(3)
-    # All three keyed by ticker for the same reason as the GEX expiry above —
-    # and the strike list especially: strikes differ between tickers, so a
-    # carried-over value can be one this ticker does not trade at all.
     _drop_stale_choice(f"opt_expiry_{selected_ticker}", all_expiries)
-    opt_expiry = col1.selectbox(
-        "Expiry", all_expiries, format_func=_format_expiry_option,
-        key=f"opt_expiry_{selected_ticker}",
-    )
+    opt_expiry = col1.selectbox("到期日", all_expiries, format_func=_format_expiry_option, key=f"opt_expiry_{selected_ticker}")
     live_strikes = set(latest_df[latest_df["expiry"] == opt_expiry]["strike"].unique())
     expired_strikes = set()
     if expired_expiries:
         expired_strikes = set(expired[expired["expiry"] == opt_expiry]["strike"].unique())
     opt_strikes = sorted(live_strikes | expired_strikes)
-    # A stored widget value that is no longer among the options makes Streamlit
-    # raise, and the option lists here narrow as you go: strikes depend on the
-    # expiry, and the sides quoted depend on the strike. Drop the stale value
-    # rather than letting the tab die on a legitimate sequence of clicks.
     _drop_stale_choice(f"opt_strike_{selected_ticker}", opt_strikes)
-    opt_strike = col2.selectbox("Strike", opt_strikes, key=f"opt_strike_{selected_ticker}")
-    # Only the sides actually quoted for this expiry and strike. Offering both
-    # unconditionally let you select a contract that was never collected — far
-    # OTM strikes are routinely listed on one side only — and the app then said
-    # "No history for the selected contract", which is true and useless.
+    opt_strike = col2.selectbox("行权价", opt_strikes, key=f"opt_strike_{selected_ticker}")
     available_types = sorted(
         latest_df[(latest_df["expiry"] == opt_expiry) & (latest_df["strike"] == opt_strike)]["option_type"].unique()
     )
     if not available_types and expired_expiries:
-        available_types = sorted(
-            expired[(expired["expiry"] == opt_expiry) & (expired["strike"] == opt_strike)]["option_type"].unique()
-        )
+        available_types = sorted(expired[(expired["expiry"] == opt_expiry) & (expired["strike"] == opt_strike)]["option_type"].unique())
     available_types = available_types or ["call", "put"]
     _drop_stale_choice(f"opt_type_{selected_ticker}", available_types)
-    opt_type = col3.selectbox("Type", available_types, key=f"opt_type_{selected_ticker}")
+    opt_type = col3.selectbox("类型", available_types, key=f"opt_type_{selected_ticker}")
 
-    # THE WINDOW HAS TO COME OFF FOR AN EXPIRED CONTRACT. The day limit is
-    # measured back from now(), and an expired contract's history is entirely in
-    # the past — so the limit trims it silently, and once the contract is older
-    # than the limit it trims it to nothing. The page would then say "no history"
-    # about a contract whose history is sitting in the table.
     is_expired = pd.Timestamp(opt_expiry) < pd.Timestamp(dt.date.today())
     contract_df = with_our_iv(db.get_contract_history(
-        conn, selected_ticker, opt_expiry, opt_strike, opt_type,
-        days=None if is_expired else history_days, source=page_source,
+        conn, selected_ticker, opt_expiry, opt_strike, opt_type, days=None if is_expired else history_days, source=page_source,
     ))
     if is_expired and not contract_df.empty:
         first, last = contract_df["collected_at"].min(), contract_df["collected_at"].max()
-        st.caption(
-            f"⏳ **Expired contract** — expired {format_date(opt_expiry)}. Stored history "
-            f"covers {format_date(first)} to {format_date(last)}, which starts when this "
-            "ticker was first collected rather than when the contract was listed."
-        )
-    render_option_detail(
-        conn, contract_df, selected_ticker, get_tracked(), opt_expiry, opt_strike, opt_type,
-        key_prefix="opt",
-    )
+        st.caption(f"⏳ **已到期合约** —— {format_date(opt_expiry)} 到期。存下的历史从 {format_date(first)} 到 {format_date(last)}。")
+    render_option_detail(conn, contract_df, selected_ticker, get_tracked(), opt_expiry, opt_strike, opt_type, key_prefix="opt")
 
-if active_view == "Screener":
-    st.subheader(f"Options screener: {selected_ticker}")
-    st.caption(
-        "A slice of the latest snapshot (not history) — every contract of the ticker with "
-        "greeks and DTE. Clicking a row opens the same charts as the Contract tab."
-    )
-
+if active_view == "筛选器":
+    st.subheader(f"筛选器: {selected_ticker}")
+    st.caption("最新一班的切片(不是历史): 全部合约带 greeks 与 DTE。勾一行打开与「单合约」相同的图。")
     screener = metrics.screener_table(latest_df)
-    # The greeks and DTE are correct AS OF THE SNAPSHOT — that is the only
-    # honest way to price them. But collection here is a manual button, so the
-    # latest snapshot can be days or weeks old, and contracts that were live
-    # when it was taken may have expired since. Showing them in a "what can I
-    # trade" screener with a cheerful positive DTE is misleading, so they are
-    # hidden by default rather than silently mixed in — and counted out loud,
-    # with a toggle, because hiding collected data without saying so is worse
-    # than showing it.
-    # years_to_expiry normalizes a tz-aware "now" itself — that is what it is
-    # for, and doing the conversion at the call site is how the tz-aware/naive
-    # mismatch keeps coming back.
     now = pd.Timestamp.utcnow()
     expired_since = pd.Series(dtype=bool)
     if not screener.empty:
@@ -1792,216 +771,148 @@ if active_view == "Screener":
     if expired_since.any():
         stale_days = int(metrics.years_to_expiry(latest_date, now) * -365)
         show_expired = st.checkbox(
-            f"Include {int(expired_since.sum())} contract(s) that have expired since this "
-            f"snapshot was collected ({stale_days} day(s) ago)",
-            key=f"screener_show_expired_{selected_ticker}",
-            help="Their greeks and DTE are as of the collection, which is why they can "
-                 "still show time left. Collect again to refresh the chain.",
+            f"包含这一班之后已到期的 {int(expired_since.sum())} 份合约(这一班是 {stale_days} 天前的)",
+            key=f"screener_show_expired_{selected_ticker}", help="它们的 greeks 与 DTE 是采集当时的。",
         )
     if not show_expired and not screener.empty:
         screener = screener[~expired_since].reset_index(drop=True)
 
     if screener.empty:
-        st.info("No data for the screener.")
+        st.info("没有可筛的数据。")
     else:
         FILTER_SPECS = [
-            ("last_price", "Option price"),
-            ("strike", "Strike"),
-            ("dte", "DTE (days)"),
-            ("open_interest", "Open interest"),
-            ("implied_volatility", "IV"),
-            ("delta", "Delta"),
-            ("gamma", "Gamma"),
-            ("theta", "Theta"),
-            ("vega", "Vega"),
-            ("rho", "Rho"),
-            ("vanna", "Vanna"),
-            ("charm", "Charm"),
+            ("last_price", "合约价"), ("strike", "行权价"), ("dte", "DTE(天)"), ("open_interest", "未平仓量"),
+            ("implied_volatility", "IV"), ("delta", "Delta"), ("gamma", "Gamma"), ("theta", "Theta"),
+            ("vega", "Vega"), ("rho", "Rho"), ("vanna", "Vanna"), ("charm", "Charm"),
         ]
-        # Number inputs instead of sliders: some columns (gamma, vega, IV at far
-        # strikes, etc.) have a tiny value range, and a slider can't hit it
-        # precisely — exact numeric input removes that problem outright. Min/max
-        # come from the actual data (full range = nothing filtered by default).
         INT_FILTER_COLUMNS = {"dte", "open_interest"}
-        with st.expander("🔍 Filters (ranges)", expanded=True):
+        with st.expander("🔍 区间筛选", expanded=True):
             filter_cols = st.columns(3)
             mask = pd.Series(True, index=screener.index)
             for i, (col_name, label) in enumerate(FILTER_SPECS):
                 series = screener[col_name].dropna()
+                if series.empty:
+                    continue
                 col_min, col_max = float(series.min()), float(series.max())
                 target = filter_cols[i % 3]
                 if col_min == col_max:
-                    target.caption(f"{label}: {col_min:g} (single value)")
+                    target.caption(f"{label}: {col_min:g}(只有一个值)")
                     continue
                 target.caption(label)
                 sub_left, sub_right = target.columns(2)
-                # Widget keys include the ticker: without this, when switching
-                # tickers Streamlit keeps the previous filter values under the
-                # same key (value= only applies at first widget mount) — the
-                # bounds silently stay from the previous ticker, which either
-                # hides part of the new ticker's contracts or (if the old range
-                # no longer intersects the new data) empties the table entirely.
                 if col_name in INT_FILTER_COLUMNS:
                     col_min, col_max = int(col_min), int(col_max)
-                    selected_min = sub_left.number_input(
-                        "from", min_value=col_min, max_value=col_max, value=col_min,
-                        step=1, key=f"screener_filter_{selected_ticker}_{col_name}_min",
-                    )
-                    selected_max = sub_right.number_input(
-                        "to", min_value=col_min, max_value=col_max, value=col_max,
-                        step=1, key=f"screener_filter_{selected_ticker}_{col_name}_max",
-                    )
+                    selected_min = sub_left.number_input("从", min_value=col_min, max_value=col_max, value=col_min, step=1,
+                                                         key=f"screener_filter_{selected_ticker}_{col_name}_min")
+                    selected_max = sub_right.number_input("到", min_value=col_min, max_value=col_max, value=col_max, step=1,
+                                                          key=f"screener_filter_{selected_ticker}_{col_name}_max")
                 else:
                     step = max((col_max - col_min) / 100, 1e-6)
-                    selected_min = sub_left.number_input(
-                        "from", min_value=col_min, max_value=col_max, value=col_min,
-                        step=step, format="%.4f", key=f"screener_filter_{selected_ticker}_{col_name}_min",
-                    )
-                    selected_max = sub_right.number_input(
-                        "to", min_value=col_min, max_value=col_max, value=col_max,
-                        step=step, format="%.4f", key=f"screener_filter_{selected_ticker}_{col_name}_max",
-                    )
+                    selected_min = sub_left.number_input("从", min_value=col_min, max_value=col_max, value=col_min, step=step,
+                                                         format="%.4f", key=f"screener_filter_{selected_ticker}_{col_name}_min")
+                    selected_max = sub_right.number_input("到", min_value=col_min, max_value=col_max, value=col_max, step=step,
+                                                          format="%.4f", key=f"screener_filter_{selected_ticker}_{col_name}_max")
                 mask &= screener[col_name].between(selected_min, selected_max)
-
         filtered = screener[mask].reset_index(drop=True)
-        st.caption(f"Contracts shown: {len(filtered)} of {len(screener)}")
-
+        st.caption(f"显示 {len(filtered)} / {len(screener)} 份合约")
         selected_contract_key = f"screener_selected_contract_{selected_ticker}"
         scroll_target_key = f"screener_scroll_target_{selected_ticker}"
         selected_contract = st.session_state.get(selected_contract_key)
         if filtered.empty:
-            st.info("No contract falls within the selected filter ranges.")
+            st.info("没有合约落在所选区间内。")
         else:
-            # A custom checkbox column instead of st.dataframe's built-in check
-            # column: this way it gets a label, and the remaining columns can be
-            # made disabled so they can't be accidentally "selected"/opened in
-            # the edit overlay — only this column is interactive. dtype=bool is
-            # explicit: on an empty list pandas would default to float64, and a
-            # CheckboxColumn over a float column crashes with
-            # StreamlitAPIException.
             display = filtered.copy()
             display["expiry"] = display["expiry"].map(format_date)
-            display.insert(0, "Show details", pd.array([
-                (row.expiry, row.strike, row.option_type) == selected_contract
-                for row in filtered.itertuples()
+            display.insert(0, "详情", pd.array([
+                (row.expiry, row.strike, row.option_type) == selected_contract for row in filtered.itertuples()
             ], dtype=bool))
-
             edited = st.data_editor(
-                display,
-                use_container_width=True,
-                hide_index=True,
-                disabled=[c for c in display.columns if c != "Show details"],
-                column_config={"Show details": st.column_config.CheckboxColumn("Show details")},
+                display, use_container_width=True, hide_index=True,
+                disabled=[c for c in display.columns if c != "详情"],
+                column_config={"详情": st.column_config.CheckboxColumn("详情")},
                 key=f"screener_table_{selected_ticker}",
             )
-
-            checked = filtered[edited["Show details"]]
+            checked = filtered[edited["详情"]]
             if checked.empty:
                 new_contract = None
             else:
-                # if more than one row somehow ends up checked — the last
-                # checked one wins (single-select emulation over checkboxes)
                 picked_row = checked.iloc[-1]
                 new_contract = (picked_row["expiry"], picked_row["strike"], picked_row["option_type"])
-
             if new_contract != selected_contract:
                 st.session_state[selected_contract_key] = new_contract
                 st.rerun()
-
         if selected_contract is not None:
             picked = filtered[
-                (filtered["expiry"] == selected_contract[0])
-                & (filtered["strike"] == selected_contract[1])
+                (filtered["expiry"] == selected_contract[0]) & (filtered["strike"] == selected_contract[1])
                 & (filtered["option_type"] == selected_contract[2])
             ]
             if not picked.empty:
                 picked = picked.iloc[0]
                 st.divider()
-                st.subheader(
-                    f"📌 Contract details: {format_date(picked['expiry'])} "
-                    f"strike {picked['strike']:g} {picked['option_type']}"
-                )
+                st.subheader(f"📌 合约详情: {format_date(picked['expiry'])} 行权价 {picked['strike']:g} {picked['option_type']}")
                 render_option_detail(
                     conn,
                     with_our_iv(db.get_contract_history(
-                        conn, selected_ticker, picked["expiry"], picked["strike"],
-                        picked["option_type"], days=history_days, source=page_source,
+                        conn, selected_ticker, picked["expiry"], picked["strike"], picked["option_type"],
+                        days=history_days, source=page_source,
                     )),
-                    selected_ticker, get_tracked(),
-                    picked["expiry"], picked["strike"], picked["option_type"],
-                    key_prefix="screener",
+                    selected_ticker, get_tracked(), picked["expiry"], picked["strike"], picked["option_type"], key_prefix="screener",
                 )
                 is_new_scroll_target = st.session_state.get(scroll_target_key) != selected_contract
                 st.session_state[scroll_target_key] = selected_contract
                 if is_new_scroll_target:
                     components.html(
                         """<script>
-                        const heading = Array.from(
-                            window.parent.document.querySelectorAll('h3')
-                        ).find(el => el.textContent.includes('Contract details'));
+                        const heading = Array.from(window.parent.document.querySelectorAll('h3'))
+                            .find(el => el.textContent.includes('合约详情'));
                         if (heading) { heading.scrollIntoView({behavior: 'smooth', block: 'start'}); }
                         </script>""",
                         height=0,
                     )
 
-if active_view == "Unusual Activity":
-    st.subheader("Unusual Activity (latest snapshot)")
-    # Only the latest snapshot is loaded; the baseline comes from the table the
-    # worker rebuilds once a day. The rules that decide what is unusual stay in
-    # metrics — only the aggregation moved.
-    flagged = metrics.unusual_activity(
-        latest_df, stats=db.get_volume_stats(conn, selected_ticker, source=page_source)
-    )
-    st.caption(f"Contracts found: {len(flagged)}")
+if active_view == "异常成交":
+    st.subheader("异常成交(最新一班)")
+    flagged = metrics.unusual_activity(latest_df, stats=db.get_volume_stats(conn, selected_ticker, source=page_source))
+    st.caption(f"命中 {len(flagged)} 份合约")
     st.dataframe(flagged, use_container_width=True)
-    with st.expander("ℹ️ How to read this"):
+    with st.expander("ℹ️ 怎么读"):
         st.write(
-            "A contract is flagged when today's volume statistically significantly exceeds "
-            f"(z-score above {config.UNUSUAL_Z_THRESHOLD}) this specific contract's own "
-            "history — not a blanket multiplier applied to every strike. Contracts with "
-            f"volume below {config.UNUSUAL_MIN_VOLUME} never make the list regardless of the "
-            "statistics — that's noise from illiquid far strikes. Contracts without enough "
-            "history use the crude check volume > 2×open interest instead. Rows are sorted "
-            "by z-score — the most unusual on top. This is not a sign of insider activity — "
-            "a large trade can be part of a hedge for an entirely different position.\n\n"
-            "The data source's volume is cumulative since the start of the trading session, "
-            "so the history for the mean/standard deviation is built from one (the latest) "
-            "snapshot per calendar day — multiple same-day collections are never mixed "
-            "together when computing the statistics."
+            f"今天的成交量相对这份合约自己的历史显著偏高(z 分数 > {config.UNUSUAL_Z_THRESHOLD})才入榜, 不是统一倍数; "
+            f"成交量低于 {config.UNUSUAL_MIN_VOLUME} 的永远不入榜。历史不够的用 成交量 > 2×OI 的粗判。按 z 分数排序。"
+            "不是内幕信号 —— 一笔大单可能是别处头寸的对冲。基线每个日历日只取最后一班。"
         )
 
-if active_view == "OI Delta":
-    st.subheader("Open Interest change (latest day vs. previous)")
-    # Two calendar days is the entire input to a day-over-day difference, and
-    # the days are named by the run log before any snapshot row is read.
-    delta = metrics.oi_delta(
-        db.get_snapshots_at(
-            conn, selected_ticker,
-            db.get_collection_moments(
-                conn, selected_ticker, days=history_days, per_day=True, source=page_source
-            )[:2],
-            source=page_source,
-        )
-    )
+if active_view == "OI 变化":
+    st.subheader("未平仓量变化(最新交易日 vs 上一交易日)")
+    delta = metrics.oi_delta(db.get_snapshots_at(
+        conn, selected_ticker,
+        db.get_collection_moments(conn, selected_ticker, days=history_days, per_day=True, source=page_source)[:2],
+        source=page_source,
+    ))
     if delta.empty:
-        st.info("Data from at least two distinct calendar days is needed to compute the OI change.")
+        st.info("至少要两个不同日历日的数据才能算 OI 变化。")
     else:
         st.dataframe(delta, use_container_width=True)
-        with st.expander("ℹ️ How to read this"):
+        with st.expander("ℹ️ 怎么读"):
             st.write(
-                "`open_interest` — the current value as of the latest day, for scale: a "
-                "1000-contract increase is a lot at OI=2000 and barely noticeable at "
-                "OI=200000. `oi_delta` — the absolute signed change: positive — new "
-                "positions opened at this strike over the last calendar day (OI grew), "
-                "negative — some positions closed. `oi_delta_pct` — the same change as a "
-                "percentage of the previous value (empty if the previous OI was 0 — growth "
-                "\"from zero\" has no percentage form). Rows are sorted by the magnitude of "
-                "the absolute delta, not by percentage or sign — the largest OI moves in "
-                "either direction are on top. It is precisely the large moves (regardless "
-                "of sign) that most often form new dealer hedging-flow levels (see the Max "
-                "Pain/GEX tab).\n\n"
-                "The data source's open interest barely updates intraday, so the comparison "
-                "is between the latest snapshots of two distinct calendar days rather than "
-                "the two most recent collections — if you collected data several times "
-                "today, only the freshest collection of the day is used for the comparison."
+                "`open_interest` 是最新一天的值(给个量级); `oi_delta` 是带符号的绝对变化(正 = 新开仓, 负 = 平仓); "
+                "`oi_delta_pct` 是相对前值的百分比(前值为 0 则空)。按绝对变化的大小排序, 不分正负 —— 大的变动最常造出新的对冲流位置。"
+                "OI 盘中基本不更新, 所以比的是两个不同日历日各自最后一班。"
             )
+
+st.markdown(
+    '<div class="gg-foot">'
+    "<p>口径: 本页数据来自 Cboe 期权链(延迟 15 分钟, 不是实时报价), 由 morning-bites 每个交易日三班(09:00 / 12:35 / 16:20 美东)归档后回放, "
+    "本页自己不向任何上游发请求; 时刻是 Cboe 给那份链盖的报价时刻, 已折成美东。GEX 正负号出自「Call 记正、Put 记负」的朴素做市商符号假设, "
+    "未按持仓成本或逐笔成交方向校正, 可能与做市商真实净头寸有出入; 与 SpotGamma 等专业模型相比, 算法与数据源都不同, 量级仅供参考。</p>"
+    f"<p>单位与纳入范围: 本页所有 GEX 读数的单位都是<b>{GEX_UNIT}</b>(gamma × 未平仓量 × 100 × 现价² × 0.01), B = 十亿美元、M = 百万美元, "
+    "与晨刊「盘前关键位」和静态 Gamma 页同一单位; 与「现价每变动 $1 的美元 gamma」差一个现价因子, 不可互换。gamma 由 Black-Scholes 用 Cboe 报价 IV 反算"
+    "(晨刊用 Cboe 厂商 gamma, 两者接近但不相等); 热图 / 状态句只看最近的若干到期日(各处写明), 晨刊纳入全部未到期到期日。"
+    "SPX 含 SPXW: 同到期日同行权价的两者在入库时合并(OI、成交量相加)。已到期合约不计。</p>"
+    "<p>墙与翻转位: 本页「Call 墙 / Put 墙」= 各侧未平仓量最大的行权价, 「插值翻转价」= 离现价最近的累计 GEX 穿零点在相邻两档间线性插值出的价格; "
+    "晨刊「Call 墙 / Put 墙」= signed GEX 的最大 / 最小档, 「累计穿零档」= 现价 ±15% 带内按行权价升序累加第一次由负转非负的<b>行权价</b>(不插值)。"
+    "两套都不是 SpotGamma 的 Zero Gamma(那是在一系列假设现价上重算整条链)。四个数各标各的口径, 不可互换, 也别拿一边去对账另一边。</p>"
+    "<p>不保证: Call/Put 墙<b>不是自动的顶或底</b>, 价格穿过它们也不保证波动就此扩大; 正 / 负 GEX 说的是对冲流的<b>倾向</b>, 不是必然, 更<b>不预测方向</b>。</p>"
+    "</div>",
+    unsafe_allow_html=True,
+)

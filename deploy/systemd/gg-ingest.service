@@ -1,0 +1,13 @@
+# 回放 morning-bites 的 out/gex 归档进库(幂等, 每次全量扫)。由 gg-ingest.path 触发, 也可手动 start。
+[Unit]
+Description=gammagrid ingest: replay morning-bites out/gex archive
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/gammagrid
+EnvironmentFile=%h/.config/gammagrid/env
+Environment=PYTHONPATH=%h/gammagrid
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/gammagrid/.venv/bin/python -m app.ingest_archive
+StandardOutput=append:%h/gammagrid/out/ingest.log
+StandardError=append:%h/gammagrid/out/ingest.log

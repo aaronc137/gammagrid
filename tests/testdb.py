@@ -38,6 +38,8 @@ def configure() -> str:
     agree rather than fighting over it.
     """
     os.environ.setdefault("DATABASE_URL", DEFAULT_TEST_URL)
+    # morning-bites: 上游夹具按 365 天的读窗口写(config 默认改成了 15, 夹具里的日期会落到窗口外)。
+    os.environ.setdefault("SNAPSHOT_HISTORY_DAYS", "365")
     url = os.environ["DATABASE_URL"]
     name = urlparse(url).path.lstrip("/")
     if not name.endswith(REQUIRED_SUFFIX):

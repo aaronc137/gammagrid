@@ -610,6 +610,79 @@ def check_contracts_backing_expiry():
     assert metrics.contracts_backing_expiry(df, pd.Timestamp("2027-01-15")) == 0, "unknown expiry"
     print("expiry-backing checks passed")
 
+def check_cboe_archive_adapter_and_ingest():
+    """morning-bites 的回放适配器与入库: OCC 解析、已到期剔除、SPX/SPXW 合并、零 IV 置空、幂等入库与 ingest.ok。"""
+    import gzip
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from app import config, ingest_archive, providers
+    from app.providers import cboe_archive
+
+    session = dt.date(2026, 9, 30)
+    yday = (session - dt.timedelta(days=1)).strftime("%y%m%d")
+    nxt = (session + dt.timedelta(days=16)).strftime("%y%m%d")
+    def opt(sym, oi, vol, iv=0.2, gamma=0.01):
+        return {"option": sym, "bid": 1.0, "ask": 1.2, "iv": iv, "open_interest": oi, "volume": vol,
+                "delta": 0.5, "gamma": gamma, "vega": 0.1, "theta": -0.05, "last_trade_price": 1.1}
+    payload = {"timestamp": "2026-09-30 12:59:20", "symbol": "_SPX", "data": {"current_price": 6500.0, "options": [
+        opt(f"SPX{yday}C06500000", 10, 1),          # 昨日到期: 剔除
+        opt(f"SPX{nxt}C06500000", 100, 7, gamma=0.02),
+        opt(f"SPXW{nxt}C06500000", 40, 3, iv=0.3),  # 同身份: 合并进上面那行(OI 大者为主)
+        opt(f"SPXW{nxt}P06400000", 55, 2, iv=0.0),  # 零 IV → None
+        opt(f"SPXW{nxt}P06300000", 5, 0),
+    ]}}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        (out / "gex" / "raw").mkdir(parents=True)
+        raw = out / "gex" / "raw" / "2026-09-30-premarket-_SPX.json.gz"
+        raw.write_bytes(gzip.compress(json.dumps(payload).encode()))
+        (out / "gex" / "2026-09-30-premarket.json").write_text(json.dumps(
+            {"date": "2026-09-30", "session": "premarket", "reads": [{"ticker": "SPX"}, {"ticker": "QQQ"}]}))
+        at, spot, chain = cboe_archive.load_chain(raw, "SPX", session)
+        assert at == dt.datetime(2026, 9, 30, 12, 59, 20) and spot == 6500.0
+        assert len(chain) == 3, chain.to_dict("records")
+        merged = chain[(chain["option_type"] == "call")].iloc[0]
+        assert merged["open_interest"] == 140 and merged["volume"] == 10 and merged["implied_volatility"] == 0.2, merged.to_dict()
+        assert merged["gamma"] == 0.02 and merged["contract_symbol"].startswith("SPX2")
+        assert merged["strike"] == 6500.0 and pd.Timestamp(merged["expiry"]) == pd.Timestamp(session + dt.timedelta(days=16))
+        zero = chain[chain["strike"] == 6400.0].iloc[0]
+        assert zero["implied_volatility"] is None or pd.isna(zero["implied_volatility"])
+        assert bool(zero["in_the_money"]) is False and bool(merged["in_the_money"]) is False
+        assert list(chain.columns)[:len(providers.CHAIN_COLUMNS)] == providers.CHAIN_COLUMNS
+        assert cboe_archive.url_ticker("spx") == "_SPX" and cboe_archive.url_ticker("QQQ") == "QQQ"
+        assert isinstance(config._read_build(), str) and config.APP_VERSION.endswith("+mb")
+
+        provider = cboe_archive.CboeArchiveProvider(out)
+        assert provider.check_access().ok and provider.latest_raw("SPX") == raw
+        assert provider.fetch_ticker_snapshot("SPX")[0] == 6500.0
+        assert provider.fetch_price_history("SPX", "6mo").empty
+        assert not cboe_archive.CboeArchiveProvider(out / "nope").check_access().ok
+
+        conn = db.get_connection()
+        try:
+            with conn.cursor() as cur:
+                for table in ("option_snapshots", "snapshot_iv_summary", "contract_registry", "collection_runs",
+                              "ticker_day_summary"):
+                    cur.execute(f"DELETE FROM {table} WHERE ticker = 'SPX'")  # noqa: S608
+            first = ingest_archive.ingest(conn, out)
+            assert first["stored"] == 1 and first["missing_raw"] == 1 and first["failed"] == 0, first
+            assert first["ingest_ok"] == "2026-09-30-premarket"
+            stamp = (out / "gammagrid" / "ingest.ok").read_text().splitlines()
+            assert stamp[0] == "2026-09-30-premarket"
+            assert db.get_collection_moments(conn, "SPX", days=None, source="cboe") == [at]
+            assert conn.execute("SELECT iv_model FROM snapshot_iv_summary WHERE ticker = 'SPX'").fetchone()[0] == "provider"
+            assert "SPX" in db.get_watchlist(conn)
+            assert db.get_collector_interval(conn) == ingest_archive.INTERVAL_MINUTES
+            again = ingest_archive.ingest(conn, out)
+            assert again["stored"] == 0 and again["present"] == 1, again
+            assert len(db.get_snapshots_at(conn, "SPX", [at], source="cboe")) == 3
+        finally:
+            conn.close()
+    print("cboe archive adapter + ingest checks passed (merge, expiry, zero IV, idempotent)")
+
+
 def check_provider_registry():
     """get_provider() is the single place a name becomes a working object.
 
@@ -623,22 +696,22 @@ def check_provider_registry():
     one-line answer for anyone adding their own."""
     from app import providers
 
-    assert providers.known_providers() == ("yahoo",), providers.known_providers()
+    assert providers.known_providers() == ("cboe",), providers.known_providers()
     assert providers.DEFAULT_PROVIDER in providers.known_providers()
 
     default = providers.get_provider()
-    assert default.name == "yahoo" and default.requires_token is False
-    assert providers.get_provider("YAHOO").name == "yahoo", "the name is case-insensitive"
-    assert providers.get_provider("  yahoo  ").name == "yahoo", "and surrounded by whitespace"
+    assert default.name == "cboe" and default.requires_token is False
+    assert providers.get_provider("CBOE").name == "cboe", "the name is case-insensitive"
+    assert providers.get_provider("  cboe  ").name == "cboe", "and surrounded by whitespace"
     assert isinstance(default, providers.DataProvider), (
-        "YahooProvider must satisfy the DataProvider protocol"
+        "CboeArchiveProvider must satisfy the DataProvider protocol"
     )
 
     try:
         providers.get_provider("definitely-not-a-provider")
     except ValueError as exc:
         assert "definitely-not-a-provider" in str(exc), exc
-        assert "yahoo" in str(exc), "the error should say what IS available"
+        assert "cboe" in str(exc), "the error should say what IS available"
     else:
         raise AssertionError("an unknown provider name must raise, not fall back")
 
@@ -849,7 +922,7 @@ def check_version_comes_from_the_changelog():
     from app import config as settings
 
     assert settings.APP_VERSION.startswith("v"), settings.APP_VERSION
-    assert settings._read_version() == settings.APP_VERSION
+    assert settings._read_version() + "+mb" == settings.APP_VERSION   # morning-bites fork 后缀
     assert settings.APP_VERSION[1].isdigit(), settings.APP_VERSION
 
     # AN EMPTY [Unreleased] HEADING IS NOT UNRELEASED WORK, and the first
@@ -1029,9 +1102,10 @@ def check_suggestions_name_a_way_forward():
     BTCUSDT and 9988.HK got nothing at all while the help text under the box
     named ADRs as the answer.
     """
-    from app import providers, suggestions
+    from app import suggestions
 
-    refused = providers.get_provider().unsupported_symbols
+    # morning-bites: 归档 provider 不拒绝任何标的; suggestions 本身与 provider 无关, 这里给它上游 Yahoo 那张表。
+    refused = {"SPX": "SPY", "NDX": "QQQ", "VIX": None}
 
     def propose(typed, known=(), catalogue=()):
         return suggestions.propose(
@@ -1192,52 +1266,14 @@ def check_the_collector_knows_about_holidays():
 
 
 def check_symbols_the_source_will_not_serve_are_explained():
-    """SPX is real, and the message about it has to say something true.
-
-    THE FAILURE THIS REPLACES. Yahoo serves no chain and no spot for a
-    cash-settled index, so a watchlist containing SPX collected nothing and the
-    log said "either the symbol does not exist, or the source is limiting
-    requests". The first half is false and the person who typed SPX knows it is
-    false — they trade it — and a message somebody knows to be wrong takes the
-    credibility of every other message with it.
-
-    THREE PLACES, ONE MAP, and the map belongs to the provider rather than to
-    this module: a licensed feed serves SPX perfectly well, so which symbols are
-    refused is a fact about the source. The three are the refusal when adding,
-    the banner on the ticker's page, and the filter in the collector — checked
-    here through the collector, which is the one with a consequence: every
-    cycle would otherwise spend a request per refused symbol against a source
-    that limits requests, and log a failure against a symbol that is fine.
-    """
+    """morning-bites: 归档 provider 不拒绝任何标的(它只读盘); collector 对「provider 自己拒绝的标的」的处理照旧。"""
     from app import collector, providers, suggestions
-
     provider = providers.get_provider()
-    refused = provider.unsupported_symbols
-    assert refused["SPX"] == "SPY" and refused["NDX"] == "QQQ", refused
-    # VIX maps to nothing on purpose: an ETF on VIX futures is a different
-    # instrument, and offering it would be worse than offering nothing.
-    assert refused["VIX"] is None, refused
+    assert getattr(provider, "unsupported_symbols", {}) == {}, provider.unsupported_symbols
+    message = suggestions.source_refusal("SPX", "SPY", provider.name)
+    assert "real symbol with listed options" in message and "SPY" in message, message
+    assert "no honest substitute" in suggestions.source_refusal("VIX", None, provider.name)
 
-    message = suggestions.source_refusal("SPX", refused["SPX"], provider.name)
-    assert "real symbol with listed options" in message, message
-    assert "SPY" in message, message
-    # The claim that was false, and the reason this exists.
-    assert "no options" not in message, message
-    no_substitute = suggestions.source_refusal("VIX", None, provider.name)
-    assert "no honest substitute" in no_substitute, no_substitute
-
-    # The other half of the same map: what these instruments are called at
-    # Yahoo, where the index QUOTE exists even though the chain does not. Used
-    # by the price-history lookup behind realized volatility, and by the spot
-    # lookup — one translation, in one place, because a translation applied in
-    # one of two places is the same bug twice.
-    from app.providers import yahoo as yahoo_provider
-    assert yahoo_provider._yahoo_symbol("SPX") == "^GSPC"
-    assert yahoo_provider._yahoo_symbol("spx") == "^GSPC", "the caller's case is not its problem"
-    assert yahoo_provider._yahoo_symbol("AAPL") == "AAPL", "anything else is passed through"
-
-    # A provider written before this attribute existed refuses nothing, rather
-    # than crashing every caller that asks.
     class OldProvider:
         name = "old"
     assert getattr(OldProvider(), "unsupported_symbols", {}) == {}
@@ -1524,90 +1560,22 @@ def check_the_strike_count_actually_decides_what_is_drawn():
 
 
 def check_the_solver_stands_aside_where_it_should():
-    """VIX, and a frame with no spot, keep the source's volatility — and say so.
-
-    NOT AN EDGE CASE, A CORRECTNESS ONE. VIX options are written on VIX
-    FUTURES, not on the index this product would price them against, so
-    inverting a Black-Scholes price for them produces a confident number that
-    means nothing. The futures curve is not something this product collects, so
-    the honest answer is to have no volatility of our own for VIX rather than an
-    invented one.
-
-    THE TWO MARKER COLUMNS ARE PRESENT EITHER WAY, and that is the part worth
-    pinning. A caller forced to write `if "iv_is_ours" in frame` before every
-    use is a caller that will one day forget — and one did, in the sibling
-    product, dying on VIX after twenty minutes of work.
-    """
+    """morning-bites: with_solved_iv 永远直通 Cboe 报价 IV, 两个标记列照加, iv_is_ours 全 False。"""
     chain = pd.DataFrame([{
         "collected_at": pd.Timestamp("2026-08-10 20:00"),
         "expiry": pd.Timestamp("2026-09-18"), "strike": 20.0, "option_type": "call",
         "underlying_price": 18.0, "last_price": 1.5, "bid": 1.4, "ask": 1.6,
         "volume": 50, "open_interest": 100, "implied_volatility": 0.85,
     }])
-
-    refused = metrics.with_solved_iv(chain, metrics.DEFAULT_PRICING, ticker="VIX")
-    assert not refused["iv_is_ours"].any(), refused.to_dict()
-    assert float(refused.iloc[0]["implied_volatility"]) == 0.85, "the source's number stands"
-    assert float(refused.iloc[0]["provider_implied_volatility"]) == 0.85
-
-    # No spot to invert against — an imported database, or a provider that
-    # serves chains without the underlying's price.
+    for ticker in ("VIX", "VXX", "SPX"):
+        kept = metrics.with_solved_iv(chain, metrics.DEFAULT_PRICING, ticker=ticker)
+        assert not kept["iv_is_ours"].any(), kept.to_dict()
+        assert float(kept.iloc[0]["implied_volatility"]) == 0.85, "the source's number stands"
+        assert float(kept.iloc[0]["provider_implied_volatility"]) == 0.85
     spotless = metrics.with_solved_iv(chain.drop(columns=["underlying_price"]))
-    assert not spotless["iv_is_ours"].any()
-    assert "provider_implied_volatility" in spotless.columns
-
-    # And where it does run, it runs: the same chain under its own ticker.
-    solved = metrics.with_solved_iv(chain, metrics.DEFAULT_PRICING, ticker="VXX")
-    assert bool(solved.iloc[0]["iv_is_ours"]), solved.to_dict()
-    assert abs(float(solved.iloc[0]["implied_volatility"]) - 0.85) > 1e-6, \
-        "the solved volatility is not the source's, or nothing was solved"
-
-    # An empty frame is a ticker in its first minutes, not an error.
+    assert not spotless["iv_is_ours"].any() and "provider_implied_volatility" in spotless.columns
     assert metrics.with_solved_iv(pd.DataFrame()).empty
-    print("IV solver checks passed (VIX and a missing spot keep the source's number)")
-
-
-def check_the_directory_parse_survives_the_real_header():
-    """The header is what breaks this, and the failure is silent.
-
-    Cboe's file starts `Company Name, Stock Symbol, DPM Name, Post/Station` —
-    with a space after each comma, so the raw field names carry a leading
-    blank. Read without stripping, the file parses cleanly into ZERO symbols:
-    nothing raises, the catalogue empties, and the search box goes quiet with
-    no error anywhere. That is why the parse is a separate function from the
-    download, and why it is checked against the real header rather than a tidy
-    one.
-    """
-    from app import catalogue
-
-    payload = (
-        "Company Name, Stock Symbol, DPM Name, Post/Station\n"
-        "APPLE INC, AAPL, Citadel Securities, 5/1\n"
-        "STATE STR SPDR S&P 500 ETF TR TR UNIT, SPY, Citadel Securities, 6/2\n"
-    )
-    rows = catalogue.parse_directory(payload)
-    assert rows == [("AAPL", "APPLE INC"), ("SPY", "STATE STR SPDR S&P 500 ETF TR TR UNIT")], rows
-
-    # A row the file truncates is skipped, not guessed at.
-    assert catalogue.parse_directory(
-        "Company Name, Stock Symbol\nAPPLE INC, AAPL\nBROKEN\n"
-    ) == [("AAPL", "APPLE INC")]
-
-    # EVERY FAILURE RAISES, because the caller's answer to a raise is "keep the
-    # catalogue we already have". A parse that returned an empty list instead
-    # would be indistinguishable from a market with no listed options.
-    for broken, why in (
-        ("", "no header at all"),
-        ("Company Name, Ticker\nAPPLE INC, AAPL\n", "the symbol column renamed"),
-        ("Company Name, Stock Symbol\n", "a header and nothing under it"),
-    ):
-        try:
-            catalogue.parse_directory(broken)
-        except ValueError:
-            continue
-        raise AssertionError(f"parsed {why!r} without complaining")
-    print("directory parse checks passed (the real header, and every way it fails)")
-
+    print("IV passthrough checks passed (Cboe quote IV everywhere, marker columns present)")
 
 def check_a_stopped_collection_does_not_look_healthy():
     """Four states, and the two that are easy to confuse kept apart.
@@ -1648,7 +1616,7 @@ def check_a_stopped_collection_does_not_look_healthy():
         assert answer is not None, f"{hours}h after the close said nothing"
         state, note = answer
         assert state == freshness.RESTING, f"{hours}h after the close reported {state}"
-        assert "Market closed" in note
+        assert "休市" in note
 
     # Sunday evening is still resting: two days later the market has not been
     # open for a single second in between.
@@ -1660,7 +1628,7 @@ def check_a_stopped_collection_does_not_look_healthy():
     monday = dt.datetime(2026, 9, 14, 16, 0, tzinfo=dt.timezone.utc)  # 12:00 New York
     state, note = freshness.assess(last, 0, 15, now=monday)
     assert state == freshness.STALE, state
-    assert "not the market being closed" in note
+    assert "不是休市" in note
     # And it counts open hours, not elapsed ones: from 15:54 Friday that is the
     # six minutes left of Friday plus 2.5 hours of Monday.
     traded = freshness.open_seconds_between(last, monday)
@@ -1679,20 +1647,20 @@ def check_a_stopped_collection_does_not_look_healthy():
     # Refusals outrank age and are named while the data is still fresh.
     state, note = freshness.assess(last, 3, 15, now=last + dt.timedelta(minutes=10))
     assert state == freshness.FAILING, state
-    assert "3" in note and "failing" in note.lower()
+    assert "3" in note and "失败" in note
 
     # One or two failures are not a story; a symbol that has never collected
     # and is not being refused either has nothing to report yet.
     assert freshness.assess(last, 2, 15, now=last + dt.timedelta(minutes=10)) is None
     assert freshness.assess(None, 1, 15, now=monday) is None
     state, note = freshness.assess(None, 4, 15, now=monday)
-    assert state == freshness.FAILING and "Nothing has been collected" in note
+    assert state == freshness.FAILING and "还没有入库" in note
 
     # Durations are read at a glance, never more than two units.
-    assert freshness.age_phrase(dt.timedelta(minutes=7)) == "7m"
-    assert freshness.age_phrase(dt.timedelta(hours=3, minutes=4, seconds=59)) == "3h 4m"
-    assert freshness.age_phrase(dt.timedelta(days=2, hours=4, minutes=30)) == "2d 4h"
-    assert freshness.age_phrase(dt.timedelta(days=2)) == "2d"
+    assert freshness.age_phrase(dt.timedelta(minutes=7)) == "7 分钟"
+    assert freshness.age_phrase(dt.timedelta(hours=3, minutes=4, seconds=59)) == "3 小时 4 分"
+    assert freshness.age_phrase(dt.timedelta(days=2, hours=4, minutes=30)) == "2 天 4 小时"
+    assert freshness.age_phrase(dt.timedelta(days=2)) == "2 天"
 
     print("freshness checks passed (resting, stale, failing, and the bell-minute trap)")
 
@@ -1921,14 +1889,14 @@ def check_the_day_row_and_the_ladder():
     assert abs(by_key["price"]["delta"] - 2.0) < 1e-9
     assert by_key["put_oi"]["kind"] == day_summary.SAME, "unchanged open interest is not a move"
     assert by_key["iv"]["kind"] == day_summary.MOVED
-    assert day_summary.format_delta(by_key["iv"]) == "+5.0 pts"
+    assert day_summary.format_delta(by_key["iv"]) == "+5.0 个百分点"
     assert day_summary.format_delta(by_key["call_oi"]) == "+20.0%"
     # A CHANGE TOO SMALL TO PRINT IS NOT A CHANGE. A ratio that moved in the
     # fourth decimal used to read "+0.00" next to two identical numbers, which
     # asks the reader to find a difference that is not there.
     invisible = day_summary._number_change("pcr_oi", "Put/Call", 0.4612, 0.4613, unit="ratio")
     assert invisible["kind"] == day_summary.MOVED
-    assert day_summary.format_delta(invisible) == "unchanged"
+    assert day_summary.format_delta(invisible) == "未变"
     assert by_key["pcr_volume"]["kind"] == day_summary.MOVED
 
     # Every line has a kind from the closed set — the view colours by it, and
@@ -1939,7 +1907,7 @@ def check_the_day_row_and_the_ladder():
     # means nothing is claimed, and the headline says which case this is.
     first = day_summary.changes(None, after, None, rollup_after)
     assert {line["kind"] for line in first} == {day_summary.UNKNOWN}
-    assert "First day" in day_summary.headline(first)
+    assert "第一天" in day_summary.headline(first)
     assert all(day_summary.format_delta(line) == "—" for line in first)
 
     # MAX PAIN IS COMPARED FOR ONE EXPIRY. When the nearest expiry rolls over,
@@ -1948,7 +1916,7 @@ def check_the_day_row_and_the_ladder():
     rolled["nearest_expiry"] = expiry + dt.timedelta(days=7)
     ladder_rolled = day_summary.changes(before, rolled, rollup_before, rollup_after)
     pain = {line["key"]: line for line in ladder_rolled}["max_pain"]
-    assert pain.get("note", "").startswith("nearest expiry was")
+    assert pain.get("note", "").startswith("此前最近到期日是")
     # Given yesterday's number FOR TODAY'S expiry, it is a comparison again.
     ladder_same = day_summary.changes(
         before, rolled, rollup_before, rollup_after, previous_same_expiry_pain=99.0
@@ -1964,8 +1932,8 @@ def check_the_day_row_and_the_ladder():
     turned = day_summary.changes(calm, stormy, rollup_before, rollup_after)
     state_line = {line["key"]: line for line in turned}["state"]
     assert state_line["kind"] == day_summary.AMPLIFYING
-    assert day_summary.headline(turned).startswith("Gamma weather turned")
-    assert day_summary.format_delta(state_line) == "amplifying"
+    assert day_summary.headline(turned).startswith("Gamma 状态从")
+    assert day_summary.format_delta(state_line) == "转向放大"
     # And the other way round, which is the green one.
     back = day_summary.changes(stormy, calm, rollup_before, rollup_after)
     assert {line["key"]: line for line in back}["state"]["kind"] == day_summary.DAMPING
@@ -1984,7 +1952,7 @@ def check_the_day_row_and_the_ladder():
     moved_wall = day_summary._number_change(
         "call_wall", "Call wall", 100.0, 105.0, unit="strikes", step=5.0
     )
-    assert day_summary.format_delta(moved_wall) == "+1 strike · +5.00"
+    assert day_summary.format_delta(moved_wall) == "+1 档 · +5.00"
     assert day_summary.format_value(moved_wall, "before") == "100.00"
     # Net GEX takes the unit its own size asks for.
     assert weather.format_gex(-671_670_000) == "-671.67M"
@@ -2107,6 +2075,7 @@ def main():
     check_watchlist_and_snapshot_dates()
     check_screener_expiry_awareness()
     check_provider_registry()
+    check_cboe_archive_adapter_and_ingest()
     check_metrics_core_is_pristine()
     check_dividend_yield_defaults_to_the_old_model()
     check_iv_average_survives_a_contract_without_iv()
@@ -2122,7 +2091,6 @@ def main():
     check_history_depth_is_known_before_the_chart()
     check_being_throttled_stops_the_whole_pass()
     check_suggestions_name_a_way_forward()
-    check_the_directory_parse_survives_the_real_header()
     check_rollup_fixture_does_not_depend_on_the_weekday()
     check_the_collector_knows_about_holidays()
     check_symbols_the_source_will_not_serve_are_explained()

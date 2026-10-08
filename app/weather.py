@@ -1,16 +1,10 @@
-"""The words that go next to the gamma numbers.
+"""Gamma 数字旁边的那几句话 —— morning-bites 中文版。
 
-WHY THE WORDS LIVE APART FROM THE ARITHMETIC. `metrics.gamma_weather` answers
-what the regime is; this answers how to say it. Two screens ask — the summary
-line above the view switcher and the day-to-day comparison — and a product that
-phrases the same state differently in two places is a product that reads as two
-products.
+`metrics.gamma_weather` 回答「状态是什么」, 这里回答「怎么说」。两处要说(状态句面板与「较昨日」), 一处措辞。
 
-WHY THERE ARE WORDS AT ALL. Net GEX is a number with eight digits and a sign,
-and the sign is the part that matters: positive means dealer hedging leans
-against the move and damps it, negative means it leans with the move and
-amplifies it. Somebody who has just installed this has no reason to know that,
-and a dashboard that only prints the number teaches it to nobody.
+措辞规矩(morning-bites ADR 2026-09-10 DIX 第三节): 正 / 负 GEX 只说对冲流「倾向抑制 / 放大」, **不写「负了波动会高」**。
+
+Modified for morning-bites, 2026-10-08. AGPL-3.0, 同本仓 LICENSE。
 """
 
 from __future__ import annotations
@@ -19,41 +13,24 @@ import pandas as pd
 
 from app import metrics, theme
 
-# Label and sentence per state. The label is what the eye lands on; the
-# sentence is what makes it mean something the first time it is read.
 WEATHER_WORDS = {
-    metrics.WEATHER_CLEAR: (
-        "Clear",
-        "Positive gamma with the flip far off — dealer hedging is damping moves.",
-    ),
-    metrics.WEATHER_FAIR: (
-        "Fair",
-        "Positive gamma, but the flip is within reach — the damping may not hold.",
-    ),
-    metrics.WEATHER_UNSETTLED: (
-        "Unsettled",
-        "The price is sitting on the gamma flip — the regime can turn either way.",
-    ),
-    metrics.WEATHER_RAIN: (
-        "Showers",
-        "Negative gamma, though the flip is close — moves are amplified for now.",
-    ),
-    metrics.WEATHER_STORM: (
-        "Storm",
-        "Negative gamma and no boundary nearby — dealer hedging amplifies moves.",
-    ),
+    metrics.WEATHER_CLEAR: ("晴", "正 gamma, 翻转位离得远 —— 对冲流倾向抑制波动。"),
+    metrics.WEATHER_FAIR: ("多云", "正 gamma, 但翻转位在一天的波幅之内 —— 抑制未必站得住。"),
+    metrics.WEATHER_UNSETTLED: ("不定", "现价贴着翻转位 —— 状态随时可能翻面。"),
+    metrics.WEATHER_RAIN: ("阵雨", "负 gamma, 但翻转位不远 —— 眼下对冲流倾向放大波动。"),
+    metrics.WEATHER_STORM: ("风暴", "负 gamma 且附近没有边界 —— 对冲流倾向放大波动。"),
 }
 
 
-def format_gex(value: float | None, signed: bool = True) -> str:
-    """Net GEX as a person reads it, scaled to its own size.
+def per_pct(value: float | None, spot: float | None) -> float | None:
+    """gammagrid 的 GEX 是每 $1 的美元 gamma; 本站全站用每 1%(× 现价 × 0.01)。只在显示处换, 库里不动。"""
+    if value is None or spot is None:
+        return None
+    return float(value) * float(spot) / 100
 
-    A FIXED UNIT IS THE WRONG UNIT FOR SOMEBODY'S WATCHLIST. An index carries
-    billions of gamma and a mid-cap carries tens of millions; printed in
-    billions the second one reads "+0.00B" on every day of its life, which is
-    a line saying nothing where a line was supposed to explain something. The
-    unit follows the number instead.
-    """
+
+def format_gex(value: float | None, signed: bool = True) -> str:
+    """按量级自选单位: B / M / K。"""
     if value is None:
         return "—"
     magnitude = abs(value)
@@ -64,55 +41,19 @@ def format_gex(value: float | None, signed: bool = True) -> str:
 
 
 def describe(weather: dict, latest_moment=None) -> dict:
-    """Label, sentence and scope for one weather reading.
-
-    THE SCOPE IS PART OF THE ANSWER, not decoration. The summary reads the near
-    term rather than the whole chain, and a regime stated without the range it
-    was measured over invites the reader to compare it with a heatmap covering
-    something else entirely.
-
-    A CHAIN WITH NO FLIP GETS ITS OWN SENTENCE. Four of the five states are
-    phrased in terms of distance to the flip, and there is no honest way to say
-    "far from" a boundary that does not exist — an index whose cumulative
-    profile never changes sign below its lowest strike is the ordinary case,
-    not a corner one. The sign then speaks alone and says so.
-
-    `from_earlier_moment` is for screens that draw this beside fresher figures:
-    the weather is built from one snapshot, and when that snapshot is not the
-    one the rest of the page is showing, the page has to be able to say so
-    instead of quietly mixing two moments.
-    """
     label, sentence = WEATHER_WORDS[weather["state"]]
     scope = ""
     if weather.get("expiry_count") and weather.get("horizon_dte") is not None:
-        n = int(weather["expiry_count"])
-        scope = f"next {int(weather['horizon_dte'])} days · {n} {'expiry' if n == 1 else 'expiries'}"
+        scope = f"未来 {int(weather['horizon_dte'])} 天 · {int(weather['expiry_count'])} 个到期日"
     if weather["gamma_flip"] is None:
-        sentence = (
-            "This chain has no gamma flip inside its strike range, so only the sign of "
-            "gamma is known — "
-            + (
-                "positive, hedging damps moves."
-                if weather["net_gex"] >= 0
-                else "negative, hedging amplifies moves."
-            )
+        sentence = "这条链在行权价范围内没有翻转位, 只知道 gamma 的符号 —— " + (
+            "正, 对冲流倾向抑制波动。" if weather["net_gex"] >= 0 else "负, 对冲流倾向放大波动。"
         )
-    earlier = (
-        latest_moment is not None
-        and pd.Timestamp(weather["collected_at"]) != pd.Timestamp(latest_moment)
-    )
-    return {
-        "label": label,
-        "sentence": sentence,
-        "scope": scope,
-        "from_earlier_moment": bool(earlier),
-    }
+    earlier = latest_moment is not None and pd.Timestamp(weather["collected_at"]) != pd.Timestamp(latest_moment)
+    return {"label": label, "sentence": sentence, "scope": scope, "from_earlier_moment": bool(earlier)}
 
 
-# The five states as a glyph. Line art rather than an emoji: an emoji renders
-# in whatever the operating system decided it looks like, at a size it also
-# decided, and the one thing this mark has to do is read the same on every
-# machine. Green is damping and purple is amplification, as everywhere else.
+# 五种状态的线描图标: 绿 = 抑制, 红 = 放大(本站 --up / --dn, ADR 2026-09-07 gex 正负色)。
 _ART = {
     metrics.WEATHER_CLEAR: (
         f'<circle cx="22" cy="22" r="9" fill="{theme.ACCENT}"/>'
@@ -162,48 +103,31 @@ def _level(label: str, value: str, tone: str = "") -> str:
 
 
 def panel(reading: dict, latest_moment=None) -> str:
-    """The summary panel that sits above the view switcher.
-
-    WHY IT IS A PANEL AND NOT A LINE OF TEXT. It answers the first question
-    somebody has on opening a ticker — is hedging damping this or amplifying
-    it — and it answers it on every view, so it has to be readable in the half
-    second before the eye moves on. That means a shape: the state as a glyph
-    and a word, the reasoning as one sentence, and the levels as tiles where
-    the number is the content and its label is an eyebrow above it.
-
-    The same shape the hosted product draws, deliberately. Two products with
-    one name should not read as two tools.
-    """
+    """视图切换上方的状态句面板。净 GEX 换成每 1% 再印, 逐处标口径。"""
     words = describe(reading, latest_moment=latest_moment)
     flip = reading.get("gamma_flip")
+    spot = reading["underlying_price"]
+    net = per_pct(reading["net_gex"], spot)
     levels = [
-        _level("Price", f"{reading['underlying_price']:,.2f}"),
-        _level("Net GEX", format_gex(reading["net_gex"]),
-               "gg-green" if reading["net_gex"] >= 0 else "gg-purple"),
+        _level("现价", f"{spot:,.2f}"),
+        _level("净 GEX · 每 1%", format_gex(net), "gg-green" if reading["net_gex"] >= 0 else "gg-purple"),
     ]
     if reading.get("call_wall") is not None:
-        levels.append(_level("Call wall", f"{reading['call_wall']:,.2f}", "gg-green"))
+        levels.append(_level("Call 墙 · OI", f"{reading['call_wall']:,.2f}", "gg-green"))
     if reading.get("put_wall") is not None:
-        levels.append(_level("Put wall", f"{reading['put_wall']:,.2f}", "gg-purple"))
-    levels.append(_level(
-        "Gamma flip",
-        "—" if flip is None else f"{flip:,.2f}",
-        "",
-    ))
+        levels.append(_level("Put 墙 · OI", f"{reading['put_wall']:,.2f}", "gg-purple"))
+    levels.append(_level("插值翻转价", "—" if flip is None else f"{flip:,.2f}", ""))
     if flip is not None:
-        levels.append(_level("Distance", f"{reading['flip_distance_pct']:.1f}%"))
-
+        levels.append(_level("距离", f"{reading['flip_distance_pct']:.1f}%"))
     art = _ART.get(reading["state"], "")
     scope = f" · {words['scope']}" if words["scope"] else ""
-    stale = ""
-    if words["from_earlier_moment"]:
-        stale = " · from an earlier collection than the rest of this screen"
+    stale = " · 来自比本页其余部分更早的一班" if words["from_earlier_moment"] else ""
     return (
         '<div class="gg-weather">'
         f'<svg width="44" height="44" viewBox="0 0 44 44" aria-hidden="true">{art}</svg>'
         '<div class="gg-weather-words">'
         f'<div class="gg-weather-label">{words["label"]}'
-        f'<span class="gg-weather-scope"> · gamma weather{scope}{stale}</span></div>'
+        f'<span class="gg-weather-scope"> · gammagrid 口径 · BS gamma{scope}{stale}</span></div>'
         f'<div class="gg-weather-sentence">{words["sentence"]}</div>'
         "</div>"
         f'<dl class="gg-levels">{"".join(levels)}</dl>'

@@ -4,3 +4,7 @@ line-length = 130
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# 页面文案是整段中文, 按字符数折行只会把一句话切成三行; 其余文件照旧 130。
+"app/dashboard.py" = ["E501"]

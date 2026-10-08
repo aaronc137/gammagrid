@@ -40,10 +40,7 @@ testdb.configure()
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DASHBOARD = os.path.join(REPO, "app", "dashboard.py")
 
-VIEWS = [
-    "Overview", "Changes", "Max Pain / GEX", "GEX Heatmap", "Volatility (IV)",
-    "Contract", "Screener", "Unusual Activity", "OI Delta",
-]
+VIEWS = ["概览", "较昨日", "Max Pain / GEX", "GEX 热图", "波动率", "单合约", "筛选器", "异常成交", "OI 变化"]
 
 def check_no_cross_view_names() -> list[str]:
     """No view may read a name that only another view assigns."""

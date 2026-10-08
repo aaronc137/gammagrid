@@ -115,11 +115,7 @@ def assess(
         # and saying so plainly is what keeps a brand-new ticker from looking
         # broken while its first pass runs.
         if consecutive_failures >= _FAILURES_BEFORE_NAMING:
-            return FAILING, (
-                f"**Nothing has been collected for this symbol yet.** The last "
-                f"{consecutive_failures} attempts failed. It may not be listed with the "
-                "current data source."
-            )
+            return FAILING, f"**这个标的还没有入库过。** 最近 {consecutive_failures} 次入库失败。"
         return None
 
     if last_success.tzinfo is None:
@@ -132,9 +128,8 @@ def assess(
     # early warning is the whole value of showing them.
     if consecutive_failures >= _FAILURES_BEFORE_NAMING:
         return FAILING, (
-            f"**Collection for this symbol is failing.** The last {consecutive_failures} "
-            f"attempts were refused; the newest data here is from "
-            f"{age_phrase(reference - last_success)} ago. Other symbols are unaffected."
+            f"**这个标的的入库在失败。** 最近 {consecutive_failures} 次失败; 页上最新的数据是 "
+            f"{age_phrase(reference - last_success)}前的。其他标的不受影响。"
         )
 
     if traded <= budget:
@@ -153,17 +148,12 @@ def assess(
             # snapshot that fires exactly at the bell. The sibling product
             # shipped that version and spent a night showing a healthy green
             # screen with no note on it, after a collection at 15:54 New York.
-            return RESTING, (
-                f"Market closed since the last collection "
-                f"({age_phrase(reference - last_success)} ago). The chain does not "
-                "change until the next session."
-            )
+            return RESTING, f"最近一班之后市场一直休市({age_phrase(reference - last_success)}前)。下一场开市前链不会变。"
         return None
 
     return STALE, (
-        f"**This data is {age_phrase(reference - last_success)} old.** The market has "
-        f"been open for {age_phrase(dt.timedelta(seconds=traded))} since the last "
-        "successful collection, so this is not the market being closed."
+        f"**这份数据是 {age_phrase(reference - last_success)}前的。** 最近一班入库之后市场已开市 "
+        f"{age_phrase(dt.timedelta(seconds=traded))}, 这不是休市 —— 查 gg-ingest 与 morning-bites 的 out/gex。"
     )
 
 
@@ -179,7 +169,7 @@ def age_phrase(gap: dt.timedelta) -> str:
     hours, seconds = divmod(seconds, 3600)
     minutes = seconds // 60
     if days:
-        return f"{days}d {hours}h" if hours else f"{days}d"
+        return f"{days} 天 {hours} 小时" if hours else f"{days} 天"
     if hours:
-        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
-    return f"{minutes}m"
+        return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
+    return f"{minutes} 分钟"

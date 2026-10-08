@@ -1,56 +1,47 @@
-# The design tokens, in the one place Streamlit reads them.
+# Streamlit 读的那份主题与服务设置 —— morning-bites 定制版。
 #
-# THE TWO PRODUCTS SHARE A VISUAL LANGUAGE ON PURPOSE. The hosted version
-# (app.gammagrid.io) carries these same values in its own stylesheet, and
-# somebody who has seen one should not read the other as a different tool.
-# Colours, radii and the type scale below are that file's values; where
-# Streamlit has no equivalent token, app/theme.py carries the rest.
-#
-# TWO FACES, NOT ONE. Chrome — labels, buttons, headings, the sentences the
-# app writes — reads in a humanist grotesk, because prose in a monospace face
-# is slower to read and this product writes a lot of prose. Only what is
-# actually tabular stays monospace: numbers, tickers, dates, code. A system
-# stack rather than a shipped webfont: nothing to download, nothing new to
-# allow in a CSP, and swapping in a self-hosted face later is a value change
-# and nothing else.
+# 颜色是 morning-bites 站点的暗色 token(templates/_theme_head.html.j2, 2026-09-08 那组; app/theme.py 里有同一组),
+# 固定暗色: 全站 9-08 起默认暗, 跟随站点明暗开关是建议项, 没做。
+# 服务项放这里而不是命令行: systemd 单元只剩一句 streamlit run。
 [theme]
 base = "dark"
-primaryColor = "#B833E0"
-backgroundColor = "#0A0C0B"
-secondaryBackgroundColor = "#111614"
-textColor = "#EDEFEC"
-borderColor = "#2A332E"
-linkColor = "#6EDE9A"
+primaryColor = "#3DBA7A"
+backgroundColor = "#0F1114"
+secondaryBackgroundColor = "#161A1F"
+textColor = "#E6E4DC"
+borderColor = "#2C3138"
+linkColor = "#F0863A"
 
-font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
-headingFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
-codeFont = "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace"
+font = "-apple-system, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif"
+headingFont = "-apple-system, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif"
+codeFont = "ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
 
-# The type scale: four sizes and no others, plus a hero size for a number that
-# IS the content of its tile. 13px is the working size — captions, buttons,
-# inputs, table cells.
 baseFontSize = 13
 headingFontSizes = ["18px", "16px", "16px", "13px", "13px", "11px"]
 headingFontWeights = [700, 700, 600, 600, 600, 600]
 metricValueFontSize = "28px"
 metricValueFontWeight = 700
 
-# Three radii and no others: panels hold content, boxes are notes and inputs,
-# controls are buttons.
-baseRadius = "6px"
-buttonRadius = "6px"
-dataframeBorderColor = "#2A332E"
-dataframeHeaderBackgroundColor = "#182220"
+baseRadius = "4px"
+buttonRadius = "4px"
+dataframeBorderColor = "#2C3138"
+dataframeHeaderBackgroundColor = "#272C32"
 showWidgetBorder = true
 
 [theme.sidebar]
-backgroundColor = "#0A0C0B"
-borderColor = "#2A332E"
+backgroundColor = "#0F1114"
+borderColor = "#2C3138"
 
 [server]
 headless = true
+# 只听回环: 公网入口是 cloudflared 隧道 + Access, 路径 /gamma(cloudflared 的 ingress 规则在 morning-bites 的 docs/cloud-setup.md)。
+address = "127.0.0.1"
+port = 8903
+baseUrlPath = "gamma"
 
-# "minimal" drops the "Deploy" button (Streamlit Community Cloud) from the
-# toolbar — that flow doesn't fit the project's own hosting/business plan.
+[browser]
+# 默认 true 会从浏览器端上报用量; 本站零外部请求。
+gatherUsageStats = false
+
 [client]
 toolbarMode = "minimal"
