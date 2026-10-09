@@ -2173,6 +2173,10 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
             provider.fetch_ticker_snapshot("AAPL")  # not shared: always a request
             assert gets == ["AAPL"], gets
 
+            # A file written after  is not "the fetch 3 minutes ago" either: the
+            # window is bounded on both sides.
+            earlier = today - dt.timedelta(hours=1)
+            assert cboe.fresh_raw(raw_dir, "SPY", earlier) is None
             stale = (today - dt.timedelta(minutes=cboe.RAW_FRESH_MINUTES + 1)).timestamp()
             os.utime(spy, (stale, stale))
             provider.fetch_ticker_snapshot("SPY")

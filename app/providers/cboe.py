@@ -156,7 +156,7 @@ def fresh_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime |
     cutoff = now.timestamp() - RAW_FRESH_MINUTES * 60
     candidates = [
         path for path in Path(raw_dir).glob(f"{now:%Y-%m-%d}-*-{url_ticker(ticker)}.json.gz")
-        if path.stat().st_mtime >= cutoff
+        if cutoff <= path.stat().st_mtime <= now.timestamp()
     ]
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
