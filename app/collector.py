@@ -154,6 +154,18 @@ def collect_watchlist(
                 raise ValueError("Empty option chain")
             rows_fetched = len(chain_df)
             oi_zero_fraction = _oi_zero_fraction(chain_df)
+            # morning-bites: a provider that knows the source's own quote time hands it
+            # over in attrs, and that — not our wall clock — is the moment stored. The
+            # same quote time twice (a second pass reading the same morning-bites raw,
+            # or a source whose clock has frozen) is not stored again.
+            collected_at = chain_df.attrs.get("collected_at") or started_at
+            if collected_at != started_at and _moment_stored(conn, ticker, active.name, collected_at):
+                results[ticker] = (
+                    f"skipped: the source's quote time {collected_at:%Y-%m-%d %H:%M:%S} UTC "
+                    "is already stored — nothing new to collect."
+                )
+                log.info("%s: %s", ticker, results[ticker])
+                continue
             if oi_zero_fraction > config.MAX_ZERO_OI_FRACTION:
                 raise ValueError(
                     f"{oi_zero_fraction:.0%} of contracts have open_interest=0 "
@@ -164,10 +176,12 @@ def collect_watchlist(
                     "Try again while the market is open."
                 )
             db.insert_snapshot(
-                conn, ticker, started_at, underlying_price, chain_df, source=active.name
+                conn, ticker, collected_at, underlying_price, chain_df, source=active.name
             )
+            # Logged at the stored moment: the day rows are derived from the run
+            # log and must find the snapshot they describe.
             db.log_run(
-                conn, started_at, _now_utc(), ticker, "success",
+                conn, collected_at, _now_utc(), ticker, "success",
                 rows_fetched=rows_fetched, oi_zero_fraction=oi_zero_fraction,
                 source=active.name,
             )
@@ -243,6 +257,15 @@ def collect_watchlist(
     # demand, a day nobody opened would simply not exist.
     _write_day_summaries(conn, collected, active.name)
     return results
+
+
+def _moment_stored(conn, ticker: str, source: str, collected_at) -> bool:
+    """Is there already a snapshot of this ticker from this source at this moment?
+    One row per collection in snapshot_iv_summary, so this is an index lookup."""
+    return conn.execute(
+        "SELECT 1 FROM snapshot_iv_summary WHERE ticker = %s AND source = %s AND collected_at = %s",
+        (ticker.upper(), source, collected_at),
+    ).fetchone() is not None
 
 
 def _write_day_summaries(conn, tickers: list[str], source: str) -> int:

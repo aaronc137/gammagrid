@@ -27,7 +27,7 @@ import testdb  # noqa: E402
 
 testdb.configure()
 
-from app import db, metrics  # noqa: E402
+from app import db, metrics, providers  # noqa: E402
 
 
 def check_years_to_expiry():
@@ -2136,6 +2136,99 @@ def check_provider_gamma_is_preferred():
 
 
 
+def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
+    """morning-bites: with GEX_RAW_DIR set, a shared ticker (SPY/QQQ/SPX) whose
+    raw landed today in the last 30 minutes is parsed from the file and no
+    request is made; a stale raw, an unshared ticker, or no raw dir → GET. The
+    moment handed to the collector is Cboe's own quote stamp."""
+    import gzip
+    import json
+    import tempfile
+
+    from app.providers import cboe
+
+    payload = {"timestamp": "2026-10-09 13:00:06", "data": {"current_price": 100.0, "options": [
+        {"option": "SPY261017C00100000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
+         "volume": 5, "open_interest": 10, "iv": 0.2, "delta": 0.5, "gamma": 0.01, "theta": -0.1, "vega": 0.3}]}}
+    gets = []
+    original_get = cboe._get
+    cboe._get = lambda ticker: (gets.append(ticker), payload)[1]
+    try:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            today = dt.datetime.now(cboe._ET)
+            spy = os.path.join(raw_dir, f"{today:%Y-%m-%d}-premarket-SPY.json.gz")
+            with gzip.open(spy, "wt", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            spx = os.path.join(raw_dir, f"{today:%Y-%m-%d}-premarket-_SPX.json.gz")
+            with gzip.open(spx, "wt", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+
+            provider = cboe.CboeProvider(raw_dir=raw_dir)
+            spot, frame = provider.fetch_ticker_snapshot("SPY")
+            assert gets == [] and len(frame) == 1, (gets, len(frame))
+            assert frame.attrs["collected_at"] == dt.datetime(2026, 10, 9, 13, 0, 6), frame.attrs
+            provider.fetch_ticker_snapshot("SPX")  # _SPX in the file name
+            assert gets == [], gets
+
+            provider.fetch_ticker_snapshot("AAPL")  # not shared: always a request
+            assert gets == ["AAPL"], gets
+
+            stale = (today - dt.timedelta(minutes=cboe.RAW_FRESH_MINUTES + 1)).timestamp()
+            os.utime(spy, (stale, stale))
+            provider.fetch_ticker_snapshot("SPY")
+            assert gets == ["AAPL", "SPY"], gets  # too old → request, with the warning
+
+            assert cboe.CboeProvider(raw_dir=None).raw_dir is None or os.environ.get("GEX_RAW_DIR")
+            _, frame = cboe.CboeProvider(raw_dir="").fetch_ticker_snapshot("SPY")  # no raw dir → upstream behaviour
+            assert gets == ["AAPL", "SPY", "SPY"], gets
+            assert frame.attrs["collected_at"] == dt.datetime(2026, 10, 9, 13, 0, 6)
+    finally:
+        cboe._get = original_get
+    print("Cboe provider reads a fresh morning-bites raw and requests only without one")
+
+
+def check_the_collector_stores_a_source_moment_once():
+    """morning-bites: a provider that hands over the source's quote time in
+    attrs has that moment stored (not the wall clock), and a second pass that
+    hands over the same moment stores nothing and says so."""
+    from app import collector
+
+    class Stamped:
+        name = "stamped-test"
+        price_history_source = "stamped-test"
+        requires_token = False
+        unsupported_symbols: dict = {}
+
+        def fetch_ticker_snapshot(self, ticker):
+            frame = pd.DataFrame([{
+                "expiry": (dt.date.today() + dt.timedelta(days=30)).isoformat(), "strike": 100.0,
+                "option_type": "call", "last_price": 1.0, "bid": 0.9, "ask": 1.1, "volume": 10,
+                "open_interest": 50, "implied_volatility": 0.3, "in_the_money": False,
+                "delta": None, "gamma": None, "theta": None, "vega": None,
+            }])
+            frame.attrs["collected_at"] = dt.datetime(2026, 10, 9, 13, 0, 6)
+            return 100.0, frame
+
+        def fetch_price_history(self, ticker, period="6mo"):
+            return pd.DataFrame(columns=["close"])
+
+        def check_access(self):
+            return providers.ProviderStatus(True, "ok")
+
+    conn = db.get_connection()
+    first = collector.collect_watchlist(conn, ["STAMPTEST"], provider=Stamped())
+    assert first == {"STAMPTEST": "success"}, first
+    moments = [r[0] for r in conn.execute(
+        "SELECT collected_at FROM snapshot_iv_summary WHERE ticker = 'STAMPTEST'").fetchall()]
+    assert moments == [dt.datetime(2026, 10, 9, 13, 0, 6)], moments
+    second = collector.collect_watchlist(conn, ["STAMPTEST"], provider=Stamped())
+    assert second["STAMPTEST"].startswith("skipped: the source's quote time 2026-10-09 13:00:06"), second
+    assert conn.execute("SELECT count(*) FROM option_snapshots WHERE ticker = 'STAMPTEST'").fetchone()[0] == 1
+    conn.close()
+    print("the collector stores the source's own moment, and stores it once")
+
+
+
 def main():
     # Start from an empty database, like the other two suites already do. This
     # one did not, and got away with it only because nothing it left behind
@@ -2177,6 +2270,8 @@ def main():
     check_the_flip_is_the_crossing_by_the_money()
     check_cboe_chain_shaping()
     check_provider_gamma_is_preferred()
+    check_cboe_reads_the_morning_bites_raw_instead_of_requesting()
+    check_the_collector_stores_a_source_moment_once()
     check_the_strike_count_actually_decides_what_is_drawn()
     check_the_solver_stands_aside_where_it_should()
     check_a_stopped_collection_does_not_look_healthy()

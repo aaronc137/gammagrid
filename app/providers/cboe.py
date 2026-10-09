@@ -28,22 +28,43 @@ stored as missing — it means "not quoted", not a volatility.
 Price history comes from Yahoo (`price_history_source`): Cboe serves no daily
 closes, and realized volatility needs them.
 
+THE SHARED TICKERS ARE NOT REQUESTED TWICE. morning-bites fetches SPY, QQQ and
+SPX itself three times a day and archives the bytes as
+`<raw dir>/<ET date>-<premarket|intraday|close>-<URL ticker>.json.gz`; SPY is
+already at that repository's 4-per-day ceiling from this IP. With
+`GEX_RAW_DIR` set, a shared ticker is read from today's raw if one landed in
+the last RAW_FRESH_MINUTES (the collector runs 3 min after each fetch), and
+the GET happens only when no such file exists — logged as a WARNING, because
+that is the one case that pushes SPY past the ceiling. Unset, every ticker is
+a GET (upstream behaviour).
+
+The moment stored is Cboe's own quote time (`payload['timestamp']`, naive UTC),
+handed to the collector in `DataFrame.attrs['collected_at']` — the same
+convention the 324 replayed archive moments carry, so a moment is the same
+moment whichever path stored it, and the collector refuses to store one twice.
+
 Modified for morning-bites, 2026-10-09. AGPL-3.0, same as the repository.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import gzip
 import json
+import logging
+import os
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from app.providers.base import CHAIN_COLUMNS, ProviderStatus
 from app.providers.yahoo import INDEX_SYMBOLS, YahooProvider
+
+log = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
 
@@ -53,6 +74,11 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 _HTTP_TIMEOUT = 60
 _REQUEST_GAP_SECONDS = 1
+
+# Tickers morning-bites fetches itself (gex.py _TICKERS), and how recent its raw
+# must be to stand in for a request: 30 min covers 09:00→09:03 and 16:20→16:23.
+SHARED_TICKERS = frozenset({"SPY", "QQQ", "SPX"})
+RAW_FRESH_MINUTES = 30
 
 
 def url_ticker(ticker: str) -> str:
@@ -113,6 +139,28 @@ def chain_from_payload(payload: dict, session_date: dt.date) -> tuple[float, pd.
     return spot, _merge_same_identity(frame)
 
 
+def quote_time(payload: dict) -> dt.datetime | None:
+    """Cboe's own stamp on the chain (naive UTC), or None if it cannot be read."""
+    try:
+        return dt.datetime.fromisoformat(str(payload["timestamp"]).replace(" ", "T")).replace(tzinfo=None)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def fresh_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime | None = None) -> Path | None:
+    """Today's (ET) newest morning-bites raw for a shared ticker, if written in the
+    last RAW_FRESH_MINUTES; None otherwise (and always None with no raw dir)."""
+    if not raw_dir or ticker.upper() not in SHARED_TICKERS:
+        return None
+    now = now or dt.datetime.now(_ET)
+    cutoff = now.timestamp() - RAW_FRESH_MINUTES * 60
+    candidates = [
+        path for path in Path(raw_dir).glob(f"{now:%Y-%m-%d}-*-{url_ticker(ticker)}.json.gz")
+        if path.stat().st_mtime >= cutoff
+    ]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
 def _get(ticker: str) -> dict:
     """One request, one attempt. Raises urllib.error.HTTPError on 4xx/5xx —
     "HTTP Error 429" is what the collector reads as rate-limited."""
@@ -133,14 +181,33 @@ class CboeProvider:
     unsupported_symbols: dict[str, str | None] = {}
     token: str | None = None
 
-    def __init__(self) -> None:
+    def __init__(self, raw_dir: str | os.PathLike | None = None) -> None:
         self._yahoo = YahooProvider()
+        self.raw_dir = raw_dir if raw_dir is not None else os.environ.get("GEX_RAW_DIR") or None
 
     def fetch_underlying_price(self, ticker: str) -> float:
         return float(_get(ticker)["data"]["current_price"])
 
     def fetch_ticker_snapshot(self, ticker: str) -> tuple[float, pd.DataFrame]:
-        return chain_from_payload(_get(ticker), dt.datetime.now(_ET).date())
+        now = dt.datetime.now(_ET)
+        raw = fresh_raw(self.raw_dir, ticker, now)
+        if raw is not None:
+            with gzip.open(raw, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            log.info("%s: read morning-bites raw %s (no request)", ticker, raw.name)
+        else:
+            if self.raw_dir and ticker.upper() in SHARED_TICKERS:
+                log.warning(
+                    "%s: 晨刊 raw 缺席(%s 里没有 %s 的、%d 分钟内的文件), 回落直取 Cboe —— "
+                    "这一次让该标的超出 morning-bites 的 ≤4 次/日",
+                    ticker, self.raw_dir, f"{now:%Y-%m-%d}", RAW_FRESH_MINUTES,
+                )
+            payload = _get(ticker)
+            log.info("%s: GET cdn.cboe.com delayed_quotes", ticker)
+        spot, frame = chain_from_payload(payload, now.date())
+        # The source's own moment, for the collector (see the module docstring).
+        frame.attrs["collected_at"] = quote_time(payload)
+        return spot, frame
 
     def fetch_price_history(self, ticker: str, period: str = "6mo") -> pd.DataFrame:
         return self._yahoo.fetch_price_history(ticker, period)
