@@ -2237,6 +2237,10 @@ def check_the_collector_stores_a_source_moment_once():
         def check_access(self):
             return providers.ProviderStatus(True, "ok")
 
+    # Offline, like every other check here: the realized-volatility refresh after a
+    # pass goes through the module-level fetch, not the provider handed in.
+    original_fetch = collector.fetch_price_history
+    collector.fetch_price_history = lambda ticker, period="6mo": pd.DataFrame(columns=["close"])
     conn = db.get_connection()
     first = collector.collect_watchlist(conn, ["STAMPTEST"], provider=Stamped())
     assert first == {"STAMPTEST": "success"}, first
@@ -2247,6 +2251,7 @@ def check_the_collector_stores_a_source_moment_once():
     assert second["STAMPTEST"].startswith("skipped: the source's quote time 2026-10-09 13:00:06"), second
     assert conn.execute("SELECT count(*) FROM option_snapshots WHERE ticker = 'STAMPTEST'").fetchone()[0] == 1
     conn.close()
+    collector.fetch_price_history = original_fetch
     print("the collector stores the source's own moment, and stores it once")
 
 
