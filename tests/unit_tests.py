@@ -623,11 +623,14 @@ def check_provider_registry():
     one-line answer for anyone adding their own."""
     from app import providers
 
-    assert providers.known_providers() == ("yahoo",), providers.known_providers()
+    assert providers.known_providers() == ("yahoo", "cboe"), providers.known_providers()
     assert providers.DEFAULT_PROVIDER in providers.known_providers()
 
-    default = providers.get_provider()
+    # morning-bites: the default is env-selected; with the variable unset it is still Yahoo.
+    default = providers.get_provider("yahoo" if os.environ.get("GAMMAGRID_PROVIDER") else None)
     assert default.name == "yahoo" and default.requires_token is False
+    cboe = providers.get_provider("cboe")
+    assert cboe.name == "cboe" and isinstance(cboe, providers.DataProvider) and cboe.price_history_source == "yahoo"
     assert providers.get_provider("YAHOO").name == "yahoo", "the name is case-insensitive"
     assert providers.get_provider("  yahoo  ").name == "yahoo", "and surrounded by whitespace"
     assert isinstance(default, providers.DataProvider), (
@@ -2089,6 +2092,50 @@ def check_day_summaries_are_written_and_filled_in():
     print("day-summary storage checks passed (upsert, the previous day, backfill, and its second run)")
 
 
+def check_cboe_chain_shaping():
+    """morning-bites: the Cboe provider drops expired series, merges SPX/SPXW
+    at the same identity (OI and volume summed, the rest from the larger-OI
+    row), stores a zero IV as missing, and returns exactly CHAIN_COLUMNS plus
+    the contract symbol."""
+    from app.providers import base, cboe
+
+    payload = {"data": {"current_price": 100.0, "options": [
+        {"option": "SPX261017C00100000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
+         "volume": 5, "open_interest": 10, "iv": 0.2, "delta": 0.5, "gamma": 0.01, "theta": -0.1, "vega": 0.3},
+        {"option": "SPXW261017C00100000", "bid": 2.0, "ask": 2.2, "last_trade_price": 2.1,
+         "volume": 7, "open_interest": 30, "iv": 0.0, "delta": 0.6, "gamma": 0.02, "theta": -0.2, "vega": 0.4},
+        {"option": "SPX261009P00090000", "bid": 0.1, "ask": 0.2, "last_trade_price": 0.1,
+         "volume": 1, "open_interest": 1, "iv": 0.5, "delta": -0.1, "gamma": 0.0, "theta": 0.0, "vega": 0.0},
+    ]}}
+    spot, frame = cboe.chain_from_payload(payload, dt.date(2026, 10, 10))
+    assert spot == 100.0
+    assert list(frame.columns) == base.CHAIN_COLUMNS + ["contract_symbol"], list(frame.columns)
+    assert len(frame) == 1, frame  # the 2026-10-09 put expired; SPX + SPXW merged
+    row = frame.iloc[0]
+    assert row["open_interest"] == 40 and row["volume"] == 12, row
+    assert row["contract_symbol"] == "SPXW261017C00100000" and row["gamma"] == 0.02, row  # larger-OI row wins
+    # groupby.first() takes the first non-missing value per field in OI order: the
+    # SPXW rows zero IV is not quoted, so the SPX rows quoted IV fills in.
+    assert row["implied_volatility"] == 0.2, row
+    assert cboe.url_ticker("SPX") == "_SPX" and cboe.url_ticker("spy") == "SPY"
+    print("Cboe chain shaping: expired dropped, SPX/SPXW merged, zero IV stored as missing")
+
+
+def check_provider_gamma_is_preferred():
+    """morning-bites patch (b): net GEX uses the provider's gamma where it served
+    one and Black-Scholes only where it did not — so a chain whose vendor gamma
+    disagrees in sign with the modelled one follows the vendor."""
+    from app import metrics_core
+
+    frame = pd.DataFrame({"gamma": [0.5, None, "x"]})
+    out = metrics_core._provider_gamma_or(frame, [0.1, 0.2, 0.3])
+    assert list(out) == [0.5, 0.2, 0.3], list(out)
+    out = metrics_core._provider_gamma_or(pd.DataFrame({"strike": [1.0]}), [0.7])
+    assert list(out) == [0.7], list(out)
+    print("provider gamma preferred, Black-Scholes only where the provider served none")
+
+
+
 def main():
     # Start from an empty database, like the other two suites already do. This
     # one did not, and got away with it only because nothing it left behind
@@ -2128,6 +2175,8 @@ def main():
     check_symbols_the_source_will_not_serve_are_explained()
     check_the_batched_gex_path_returns_the_old_numbers()
     check_the_flip_is_the_crossing_by_the_money()
+    check_cboe_chain_shaping()
+    check_provider_gamma_is_preferred()
     check_the_strike_count_actually_decides_what_is_drawn()
     check_the_solver_stands_aside_where_it_should()
     check_a_stopped_collection_does_not_look_healthy()

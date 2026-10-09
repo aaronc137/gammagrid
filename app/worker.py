@@ -298,6 +298,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             archive_if_due(conn)
             print(f"Collected {collect_once(conn)} ticker(s).")
+            # morning-bites: `once` is the whole schedule here (systemd timer), so the
+            # daily maintenance run_forever does has to happen on this path too.
+            rebuild_stale_volume_stats(conn)
+            fill_missing_day_summaries(conn)
             print(f"Recomputed {catch_up_own_iv(conn)} stored volatility average(s).")
             print(f"Symbol directory: {refresh_catalogue_if_due(conn)} symbol(s) loaded.")
         finally:

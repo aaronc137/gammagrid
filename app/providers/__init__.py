@@ -52,6 +52,8 @@ above, so nothing stops you writing your own against whatever you subscribe to.
 
 from __future__ import annotations
 
+import os
+
 from app.providers.base import (
     CHAIN_COLUMNS,
     CHAIN_OPTIONAL_COLUMNS,
@@ -62,7 +64,9 @@ from app.providers.base import (
 )
 from app.providers.yahoo import YahooProvider
 
-DEFAULT_PROVIDER = "yahoo"
+# morning-bites: GAMMAGRID_PROVIDER=cboe selects app/providers/cboe.py; unset, the
+# upstream default (Yahoo) is unchanged.
+DEFAULT_PROVIDER = os.environ.get("GAMMAGRID_PROVIDER", "yahoo")
 
 __all__ = [
     "CHAIN_COLUMNS",
@@ -79,7 +83,7 @@ __all__ = [
 
 
 def known_providers() -> tuple[str, ...]:
-    return ("yahoo",)
+    return ("yahoo", "cboe")
 
 
 def get_provider(name: str | None = None, token: str | None = None) -> DataProvider:
@@ -94,6 +98,10 @@ def get_provider(name: str | None = None, token: str | None = None) -> DataProvi
 
     if resolved == "yahoo":
         return YahooProvider()
+    if resolved == "cboe":
+        from app.providers.cboe import CboeProvider  # lazy, as the docstring asks
+
+        return CboeProvider()
 
     raise ValueError(
         f"Unknown data provider {resolved!r}. Known providers: {', '.join(known_providers())}. "
