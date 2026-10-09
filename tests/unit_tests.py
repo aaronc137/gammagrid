@@ -2137,12 +2137,14 @@ def check_provider_gamma_is_preferred():
 
 
 def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
-    """morning-bites: with GEX_RAW_DIR set, a shared ticker (SPY/QQQ/SPX) whose
-    raw landed today in the last 30 minutes is parsed from the file and no
-    request is made; a stale raw, an unshared ticker, or no raw dir → GET. The
-    moment handed to the collector is Cboe's own quote stamp."""
+    """morning-bites: with GEX_RAW_DIR set, a shared ticker (SPY/QQQ/SPX) with a
+    raw from today (ET) — however old — is parsed from the file and no request
+    is made; only yesterday's raw, an unshared ticker, or no raw dir → GET, and
+    the shared-ticker fallback is a WARNING. The moment handed to the collector
+    is Cboe's own quote stamp."""
     import gzip
     import json
+    import logging
     import tempfile
 
     from app.providers import cboe
@@ -2153,6 +2155,15 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
     gets = []
     original_get = cboe._get
     cboe._get = lambda ticker: (gets.append(ticker), payload)[1]
+    warnings = []
+
+    class Catch(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                warnings.append(record.getMessage())
+
+    catcher = Catch()
+    cboe.log.addHandler(catcher)
     try:
         with tempfile.TemporaryDirectory() as raw_dir:
             today = dt.datetime.now(cboe._ET)
@@ -2173,14 +2184,20 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
             provider.fetch_ticker_snapshot("AAPL")  # not shared: always a request
             assert gets == ["AAPL"], gets
 
-            # A file written after  is not "the fetch 3 minutes ago" either: the
-            # window is bounded on both sides.
+            # A file written after `now` does not count.
             earlier = today - dt.timedelta(hours=1)
-            assert cboe.fresh_raw(raw_dir, "SPY", earlier) is None
-            stale = (today - dt.timedelta(minutes=cboe.RAW_FRESH_MINUTES + 1)).timestamp()
-            os.utime(spy, (stale, stale))
+            assert cboe.todays_raw(raw_dir, "SPY", earlier) is None
+            # Today's raw from hours ago still counts (a Collect button pressed at
+            # 18:20 reads the 16:20 close raw); the collector's dedupe makes that a no-op.
+            old = (today - dt.timedelta(hours=9)).timestamp()
+            os.utime(spy, (old, old))
             provider.fetch_ticker_snapshot("SPY")
-            assert gets == ["AAPL", "SPY"], gets  # too old → request, with the warning
+            assert gets == ["AAPL"] and warnings == [], (gets, warnings)
+            # Only yesterday's raw → request, and the fallback is said out loud.
+            os.rename(spy, os.path.join(raw_dir, f"{today - dt.timedelta(days=1):%Y-%m-%d}-close-SPY.json.gz"))
+            provider.fetch_ticker_snapshot("SPY")
+            assert gets == ["AAPL", "SPY"], gets
+            assert len(warnings) == 1 and "晨刊 raw 缺席" in warnings[0], warnings
 
             assert cboe.CboeProvider(raw_dir=None).raw_dir is None or os.environ.get("GEX_RAW_DIR")
             _, frame = cboe.CboeProvider(raw_dir="").fetch_ticker_snapshot("SPY")  # no raw dir → upstream behaviour
@@ -2188,7 +2205,8 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
             assert "collected_at" not in frame.attrs, frame.attrs  # a GET keeps the wall clock
     finally:
         cboe._get = original_get
-    print("Cboe provider reads a fresh morning-bites raw and requests only without one")
+        cboe.log.removeHandler(catcher)
+    print("Cboe provider reads today's morning-bites raw and requests only without one")
 
 
 def check_the_collector_stores_a_source_moment_once():

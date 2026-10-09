@@ -32,11 +32,20 @@ THE SHARED TICKERS ARE NOT REQUESTED TWICE. morning-bites fetches SPY, QQQ and
 SPX itself three times a day and archives the bytes as
 `<raw dir>/<ET date>-<premarket|intraday|close>-<URL ticker>.json.gz`; SPY is
 already at that repository's 4-per-day ceiling from this IP. With
-`GEX_RAW_DIR` set, a shared ticker is read from today's raw if one landed in
-the last RAW_FRESH_MINUTES (the collector runs 3 min after each fetch), and
-the GET happens only when no such file exists — logged as a WARNING, because
-that is the one case that pushes SPY past the ceiling. Unset, every ticker is
-a GET (upstream behaviour).
+`GEX_RAW_DIR` set, a shared ticker is read from TODAY'S NEWEST raw, however old
+it is — a second read of the same raw is a no-op, because the collector refuses
+to store a moment it already holds — and the GET happens only on a day with no
+raw at all, logged as a WARNING because that is the one case that pushes SPY
+past the ceiling. (A 30-minute freshness window was tried first and cost a
+breach on 2026-10-09: a Collect button pressed at 18:20 found the 16:20 raw
+"too old" and requested all three.) Unset, every ticker is a GET (upstream
+behaviour).
+
+Every request, whoever makes it (collector, the dashboard's Collect button, the
+Add-ticker check, check_access), logs one `GET cdn.cboe.com delayed_quotes`
+line from `_get`, so the day's count can be read off the log. The logger gets a
+stderr handler of its own when nothing has configured logging — under
+`streamlit run` nothing has, and an INFO line would otherwise vanish.
 
 A chain read from a raw is stored at Cboe's own quote time (`payload['timestamp']`,
 naive UTC), handed to the collector in `DataFrame.attrs['collected_at']` — the
@@ -66,6 +75,12 @@ from app.providers.base import CHAIN_COLUMNS, ProviderStatus
 from app.providers.yahoo import INDEX_SYMBOLS, YahooProvider
 
 log = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    # Under `streamlit run` nothing configures the root logger, so an INFO line
+    # from here would be dropped; the worker calls basicConfig before this module
+    # is imported and is left alone.
+    log.addHandler(logging.StreamHandler())
+    log.setLevel(logging.INFO)
 
 _ET = ZoneInfo("America/New_York")
 
@@ -76,10 +91,8 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 _HTTP_TIMEOUT = 60
 _REQUEST_GAP_SECONDS = 1
 
-# Tickers morning-bites fetches itself (gex.py _TICKERS), and how recent its raw
-# must be to stand in for a request: 30 min covers 09:00→09:03 and 16:20→16:23.
+# Tickers morning-bites fetches itself (gex.py _TICKERS).
 SHARED_TICKERS = frozenset({"SPY", "QQQ", "SPX"})
-RAW_FRESH_MINUTES = 30
 
 
 def url_ticker(ticker: str) -> str:
@@ -148,16 +161,16 @@ def quote_time(payload: dict) -> dt.datetime | None:
         return None
 
 
-def fresh_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime | None = None) -> Path | None:
-    """Today's (ET) newest morning-bites raw for a shared ticker, if written in the
-    last RAW_FRESH_MINUTES; None otherwise (and always None with no raw dir)."""
+def todays_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime | None = None) -> Path | None:
+    """Today's (ET) newest morning-bites raw for a shared ticker, whatever its age;
+    None when there is none yet today (and always None with no raw dir). A file
+    written after `now` does not count — the window is only ever bounded above."""
     if not raw_dir or ticker.upper() not in SHARED_TICKERS:
         return None
     now = now or dt.datetime.now(_ET)
-    cutoff = now.timestamp() - RAW_FRESH_MINUTES * 60
     candidates = [
         path for path in Path(raw_dir).glob(f"{now:%Y-%m-%d}-*-{url_ticker(ticker)}.json.gz")
-        if cutoff <= path.stat().st_mtime <= now.timestamp()
+        if path.stat().st_mtime <= now.timestamp()
     ]
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
@@ -168,6 +181,7 @@ def _get(ticker: str) -> dict:
     request = urllib.request.Request(
         _CBOE_URL.format(ticker=url_ticker(ticker)), headers={"User-Agent": _UA}
     )
+    log.info("%s: GET cdn.cboe.com delayed_quotes", ticker.upper())
     with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
     time.sleep(_REQUEST_GAP_SECONDS)
@@ -191,7 +205,7 @@ class CboeProvider:
 
     def fetch_ticker_snapshot(self, ticker: str) -> tuple[float, pd.DataFrame]:
         now = dt.datetime.now(_ET)
-        raw = fresh_raw(self.raw_dir, ticker, now)
+        raw = todays_raw(self.raw_dir, ticker, now)
         if raw is not None:
             with gzip.open(raw, "rt", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -199,12 +213,11 @@ class CboeProvider:
         else:
             if self.raw_dir and ticker.upper() in SHARED_TICKERS:
                 log.warning(
-                    "%s: 晨刊 raw 缺席(%s 里没有 %s 的、%d 分钟内的文件), 回落直取 Cboe —— "
+                    "%s: 晨刊 raw 缺席(%s 里还没有 %s 的文件), 回落直取 Cboe —— "
                     "这一次让该标的超出 morning-bites 的 ≤4 次/日",
-                    ticker, self.raw_dir, f"{now:%Y-%m-%d}", RAW_FRESH_MINUTES,
+                    ticker, self.raw_dir, f"{now:%Y-%m-%d}",
                 )
             payload = _get(ticker)
-            log.info("%s: GET cdn.cboe.com delayed_quotes", ticker)
         spot, frame = chain_from_payload(payload, now.date())
         if raw is not None:
             # The raw's own moment, for the collector (see the module docstring). Only
