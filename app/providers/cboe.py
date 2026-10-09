@@ -38,10 +38,11 @@ the GET happens only when no such file exists — logged as a WARNING, because
 that is the one case that pushes SPY past the ceiling. Unset, every ticker is
 a GET (upstream behaviour).
 
-The moment stored is Cboe's own quote time (`payload['timestamp']`, naive UTC),
-handed to the collector in `DataFrame.attrs['collected_at']` — the same
-convention the 324 replayed archive moments carry, so a moment is the same
-moment whichever path stored it, and the collector refuses to store one twice.
+A chain read from a raw is stored at Cboe's own quote time (`payload['timestamp']`,
+naive UTC), handed to the collector in `DataFrame.attrs['collected_at']` — the
+convention the 324 replayed archive moments carry — and the collector refuses to
+store the same moment twice, so a second pass over the same raw is a no-op. A
+chain fetched by GET keeps the collector's wall clock as its moment.
 
 Modified for morning-bites, 2026-10-09. AGPL-3.0, same as the repository.
 """
@@ -205,8 +206,13 @@ class CboeProvider:
             payload = _get(ticker)
             log.info("%s: GET cdn.cboe.com delayed_quotes", ticker)
         spot, frame = chain_from_payload(payload, now.date())
-        # The source's own moment, for the collector (see the module docstring).
-        frame.attrs["collected_at"] = quote_time(payload)
+        if raw is not None:
+            # The raw's own moment, for the collector (see the module docstring). Only
+            # for the raw path: on a GET the wall clock stays the moment, because
+            # Cboe's stamp is the last quote and sits still for days on a thin name
+            # while open interest keeps updating overnight — a moment that never
+            # moves would make the collector skip exactly those updates.
+            frame.attrs["collected_at"] = quote_time(payload)
         return spot, frame
 
     def fetch_price_history(self, ticker: str, period: str = "6mo") -> pd.DataFrame:

@@ -2185,7 +2185,7 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
             assert cboe.CboeProvider(raw_dir=None).raw_dir is None or os.environ.get("GEX_RAW_DIR")
             _, frame = cboe.CboeProvider(raw_dir="").fetch_ticker_snapshot("SPY")  # no raw dir → upstream behaviour
             assert gets == ["AAPL", "SPY", "SPY"], gets
-            assert frame.attrs["collected_at"] == dt.datetime(2026, 10, 9, 13, 0, 6)
+            assert "collected_at" not in frame.attrs, frame.attrs  # a GET keeps the wall clock
     finally:
         cboe._get = original_get
     print("Cboe provider reads a fresh morning-bites raw and requests only without one")
