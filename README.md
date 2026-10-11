@@ -146,11 +146,11 @@ been downloaded yet — it arrives on the collector's next pass, and until then
 the box still accepts any symbol you type. If it never arrives, check whether
 the machine can reach `cboe.com`; nothing else in the product depends on it.
 
-**"… is a real symbol with listed options, but the source does not serve its
-option chain."** For VIX, and it is not a typo: VIX options are listed and
-heavily traded, but they are priced off VIX futures rather than off the index,
-and this source serves no futures curve to price them against — every greek
-would be wrong. It is offered nothing on purpose: an ETF on VIX futures is a
+**"… is a real symbol with listed options, but they are priced off VIX
+futures."** For VIX, and it is not a typo: VIX options are listed and heavily
+traded, and Yahoo even lists a chain, but they are priced off VIX futures
+rather than off the index, and this source serves no futures curve to price
+them against — every greek would be wrong. It is offered nothing on purpose: an ETF on VIX futures is a
 different instrument with its own term structure, not a proxy for the index,
 and pointing you at one would be worse than saying nothing. Which symbols are
 refused is a property of the source, not of the market.

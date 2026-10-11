@@ -1277,7 +1277,8 @@ def check_symbols_the_source_will_not_serve_are_explained():
     assert "does not serve" not in series, series
     vix = suggestions.source_refusal("VIX", None, provider.name)
     assert "real symbol with listed options" in vix and "no honest substitute" in vix, vix
-    assert "no options" not in vix, vix
+    assert "priced off VIX futures" in vix, vix
+    assert "no options" not in vix and "does not serve its option chain" not in vix, vix
 
     # A provider written before this attribute existed refuses nothing, rather
     # than crashing every caller that asks.
