@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   — 450 pixels and an outside request — to show the underlying's price on
   screens that are about the option chain. It now sits at the foot of
   Overview, under "Underlying price", where the hosted version keeps it.
+- **The GEX heatmap and the day rows behind Changes are built about three
+  times faster**, with the same numbers to the last bit. On a stored SPY chain
+  of 8,762 contracts the heatmap went from 68 ms to 19 ms and a day row from
+  60 ms to 26 ms. Two things were repeated for answers already known: the
+  16:00 New York close of each expiry was worked out once per contract rather
+  than once per expiry, and the normal distribution was evaluated through a
+  wrapper whose argument checks cost more than the arithmetic. The shared
+  calculation core is back in step with the hosted version's.
 
 ## [0.7.0] - 2026-09-19
 

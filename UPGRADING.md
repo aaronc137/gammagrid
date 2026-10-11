@@ -39,6 +39,19 @@ touched by the move and is still the backup for those versions.)*
 | **One-way** | The database is changed in a way an older version does not understand. Going back needs the backup. Your collected rows are still there and still correct. |
 | **Destructive** | Something is rewritten or removed. Back up first, read the entry in full. **No release has been in this category, and the project's first rule is that collected data is never deleted** — if one ever appears here, it will say exactly what goes. |
 
+## v0.7.0 → next release (unreleased)
+
+**Risk: safe. No migration; nothing in the database is rewritten or deleted.**
+
+**What you may notice on the first run.**
+
+- **The worker rebuilds the Changes rows once.** Each row records which
+  version of the formulas produced it, and this release changes the
+  calculation code (for speed — every number comes out identical). Rows built
+  by the older code are rebuilt from the stored snapshots at the worker's next
+  start, up to 45 days back, exactly as on the upgrade to v0.7.0 — at roughly
+  a third of that release's cost per ticker-day.
+
 ## v0.6.1 → v0.7.0
 
 **Risk: safe. Two additive migrations, nothing rewritten and nothing deleted.**
