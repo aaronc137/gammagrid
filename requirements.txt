@@ -1,4 +1,10 @@
-yfinance>=0.2.40
+# The one exact pin, and on purpose. yfinance is an unofficial wrapper around
+# a website rather than an API, and its releases change what a chain, an
+# expiry list or an index quote comes back as — so `>=` meant that the same
+# commit built today and built next month could collect differently, with
+# nothing in this repository having changed. Moving it is a deliberate
+# one-line change: bump it, rebuild, run the checks and one real collection.
+yfinance==1.7.0
 pandas>=2.2
 numpy>=1.26
 scipy>=1.13

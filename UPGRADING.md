@@ -45,6 +45,12 @@ touched by the move and is still the backup for those versions.)*
 
 **What you may notice on the first run.**
 
+- **`yfinance` is pinned to exactly 1.7.0.** It used to be `>=0.2.40`, which
+  let the same commit collect differently depending on the day the image was
+  built. `docker compose up --build` installs the pinned version on its own.
+  Running from source, run `pip install -r requirements.txt` again — an older
+  yfinance left in your environment is not what this release was checked
+  against.
 - **The worker rebuilds the Changes rows once.** Each row records which
   version of the formulas produced it, and this release changes the
   calculation code (for speed — every number comes out identical). Rows built

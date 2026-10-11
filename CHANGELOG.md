@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   than once per expiry, and the normal distribution was evaluated through a
   wrapper whose argument checks cost more than the arithmetic. The shared
   calculation core is back in step with the hosted version's.
+- **`yfinance` is pinned to 1.7.0** instead of "0.2.40 or anything newer".
+  It is an unofficial wrapper around a website, and a new release can change
+  what a chain comes back as; with an open range the same commit collected
+  differently depending on the day its image was built.
 
 ## [0.7.0] - 2026-09-19
 
