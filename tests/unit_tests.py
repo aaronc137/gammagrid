@@ -1056,10 +1056,13 @@ def check_suggestions_name_a_way_forward():
     # 1. The source's own refusal, and it is the ONLY one that blocks: the rest
     # is a reading of what somebody meant, and being wrong about that must cost
     # them a sentence rather than the ability to try.
-    spx = propose("SPX")
-    assert spx.reason == "source" and spx.substitute == "SPY", spx
-    assert spx.blocking, "only the source's refusal takes the button away"
+    spxw = propose("SPXW")
+    assert spxw.reason == "source" and spxw.substitute == "SPX", spxw
+    assert spxw.blocking, "only the source's refusal takes the button away"
     assert not propose("BTCUSD").blocking
+    # SPX itself is collected now, and nothing stands between it and the button.
+    spx = propose("SPX")
+    assert spx is None or not spx.blocking, spx
 
     # 2. No US-listed options at all — and the pair as three terminals write it.
     # One form is stored and the spelling is folded before the lookup, so the
@@ -1205,49 +1208,76 @@ def check_the_collector_knows_about_holidays():
 
 
 def check_symbols_the_source_will_not_serve_are_explained():
-    """SPX is real, and the message about it has to say something true.
+    """Index options are collected under the index's own symbol; what is still
+    refused is refused with something true to say.
 
-    THE FAILURE THIS REPLACES. Yahoo serves no chain and no spot for a
-    cash-settled index, so a watchlist containing SPX collected nothing and the
-    log said "either the symbol does not exist, or the source is limiting
-    requests". The first half is false and the person who typed SPX knows it is
-    false — they trade it — and a message somebody knows to be wrong takes the
-    credibility of every other message with it.
+    THE INDEX HALF. Yahoo serves SPX, XSP, NDX, RUT and DJX chains under the
+    caret (`^SPX`), and serves NONE under the publisher's quote (`^GSPC`,
+    `^DJI`: zero expiries, measured on yfinance 1.7.0) — which is how this
+    product once concluded there were no index options at all, and refused
+    them. One translation, used by every lookup — the chain, the spot, the
+    price history and the has-options check — so that the spot a chain is
+    valued against comes from the same instrument, and so that a lookup added
+    later cannot forget it. DJX in particular must not go to `^DJI`: that is
+    the Dow itself, a hundred times DJX's level.
 
-    THREE PLACES, ONE MAP, and the map belongs to the provider rather than to
-    this module: a licensed feed serves SPX perfectly well, so which symbols are
-    refused is a fact about the source. The three are the refusal when adding,
-    the banner on the ticker's page, and the filter in the collector — checked
-    here through the collector, which is the one with a consequence: every
-    cycle would otherwise spend a request per refused symbol against a source
-    that limits requests, and log a failure against a symbol that is fine.
+    THE REFUSED HALF. VIX, whose options are priced off futures this source
+    does not serve, and the series roots SPXW and NDXP, which are collected
+    inside SPX and NDX — the message for a series root says so instead of
+    claiming the source will not serve it. Checked through the collector too,
+    which is where a refusal has a consequence: every cycle would otherwise
+    spend a request per refused symbol against a source that limits requests.
     """
     from app import collector, providers, suggestions
+    from app.providers import yahoo as yahoo_provider
 
     provider = providers.get_provider()
     refused = provider.unsupported_symbols
-    assert refused["SPX"] == "SPY" and refused["NDX"] == "QQQ", refused
-    # VIX maps to nothing on purpose: an ETF on VIX futures is a different
-    # instrument, and offering it would be worse than offering nothing.
-    assert refused["VIX"] is None, refused
+    for index in ("SPX", "XSP", "NDX", "RUT", "DJX"):
+        assert index not in refused, f"{index} is collected now and must not be refused"
+    assert refused == {"SPXW": "SPX", "NDXP": "NDX", "VIX": None, "VIXW": None}, refused
 
-    message = suggestions.source_refusal("SPX", refused["SPX"], provider.name)
-    assert "real symbol with listed options" in message, message
-    assert "SPY" in message, message
-    # The claim that was false, and the reason this exists.
-    assert "no options" not in message, message
-    no_substitute = suggestions.source_refusal("VIX", None, provider.name)
-    assert "no honest substitute" in no_substitute, no_substitute
-
-    # The other half of the same map: what these instruments are called at
-    # Yahoo, where the index QUOTE exists even though the chain does not. Used
-    # by the price-history lookup behind realized volatility, and by the spot
-    # lookup — one translation, in one place, because a translation applied in
-    # one of two places is the same bug twice.
-    from app.providers import yahoo as yahoo_provider
-    assert yahoo_provider._yahoo_symbol("SPX") == "^GSPC"
-    assert yahoo_provider._yahoo_symbol("spx") == "^GSPC", "the caller's case is not its problem"
+    expected = {"SPX": "^SPX", "XSP": "^XSP", "NDX": "^NDX", "RUT": "^RUT", "DJX": "^DJX"}
+    for ticker, caret in expected.items():
+        assert yahoo_provider._yahoo_symbol(ticker) == caret, ticker
+    assert yahoo_provider._yahoo_symbol("spx") == "^SPX", "the caller's case is not its problem"
     assert yahoo_provider._yahoo_symbol("AAPL") == "AAPL", "anything else is passed through"
+    assert "^GSPC" not in yahoo_provider.INDEX_SYMBOLS.values()
+    assert "^DJI" not in yahoo_provider.INDEX_SYMBOLS.values()
+
+    # Every lookup goes through the translation: the source module's own
+    # yf.Ticker is replaced and asked which symbol it was built with.
+    asked = []
+
+    class FakeTicker:
+        def __init__(self, symbol):
+            asked.append(symbol)
+            self.ticker = symbol
+            self.fast_info = {"lastPrice": 7800.0}
+            self.options = ()
+
+        def history(self, period):
+            return pd.DataFrame({"Close": [1.0, 2.0]})
+
+    real_ticker = yahoo_provider.yf.Ticker
+    yahoo_provider.yf.Ticker = FakeTicker
+    try:
+        source = yahoo_provider.YahooProvider()
+        spot, chain = source.fetch_ticker_snapshot("SPX")
+        assert spot == 7800.0 and chain.empty
+        assert source.fetch_underlying_price("DJX") == 7800.0
+        assert list(source.fetch_price_history("NDX")["close"]) == [1.0, 2.0]
+        assert source.underlying_has_options("RUT") is False
+    finally:
+        yahoo_provider.yf.Ticker = real_ticker
+    assert asked == ["^SPX", "^DJX", "^NDX", "^RUT"], asked
+
+    series = suggestions.source_refusal("SPXW", refused["SPXW"], provider.name)
+    assert "series of SPX options" in series and "**SPX**" in series, series
+    assert "does not serve" not in series, series
+    vix = suggestions.source_refusal("VIX", None, provider.name)
+    assert "real symbol with listed options" in vix and "no honest substitute" in vix, vix
+    assert "no options" not in vix, vix
 
     # A provider written before this attribute existed refuses nothing, rather
     # than crashing every caller that asks.
@@ -1261,7 +1291,7 @@ def check_symbols_the_source_will_not_serve_are_explained():
     # quietly passing on a mocked success.
     class RefusingProvider:
         name = "refusing"
-        unsupported_symbols = {"SPX": "SPY"}
+        unsupported_symbols = {"VIX": None, "SPXW": "SPX"}
 
         def fetch_ticker_snapshot(self, ticker):
             raise AssertionError(f"asked the source for {ticker}, which it refuses")
@@ -1269,14 +1299,14 @@ def check_symbols_the_source_will_not_serve_are_explained():
     conn = db.get_connection()
     try:
         before = len(db.get_recent_runs(conn, limit=200))
-        outcome = collector.collect_watchlist(conn, ["SPX"], provider=RefusingProvider())
-        assert outcome["SPX"].startswith("skipped: "), outcome
-        assert "SPY" in outcome["SPX"], outcome
+        outcome = collector.collect_watchlist(conn, ["VIX", "SPXW"], provider=RefusingProvider())
+        assert outcome["VIX"].startswith("skipped: "), outcome
+        assert outcome["SPXW"].startswith("skipped: ") and "SPX" in outcome["SPXW"], outcome
         assert len(db.get_recent_runs(conn, limit=200)) == before, \
             "a decision not to attempt is not an attempt, and does not belong in the log"
     finally:
         conn.close()
-    print("unsupported-symbol checks passed (three places, one map, no requests)")
+    print("index-symbol checks passed (one translation for every lookup, refusals that say something true)")
 
 
 def check_the_batched_gex_path_returns_the_old_numbers():
