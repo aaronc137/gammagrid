@@ -520,6 +520,38 @@ def get_recent_runs(conn: psycopg.Connection, limit: int = 50) -> pd.DataFrame:
     )
 
 
+# The words the collector's zero-open-interest guard writes into the run log
+# (collector.ZeroOpenInterestChain). Matched rather than stored in a column of
+# its own: the run log is the state, and rows written before this distinction
+# existed carry the same words, so they are classified the same way without a
+# migration.
+ZERO_OI_REFUSAL = "of contracts have open_interest=0"
+
+
+def is_closed_market_refusal(started_at, error_message: str | None) -> bool:
+    """Whether a failed run was the zero-open-interest guard firing while the
+    market was shut — an outcome, not a failure.
+
+    Outside regular hours Yahoo serves chains with open interest zeroed on
+    83–97% of contracts (measured on the run log collected here), and the
+    guard rightly refuses to store them. Counted as failures, the single
+    snapshot the worker takes on each closed day added up — Saturday, Sunday,
+    Monday before the open — to the three that make every screen say
+    "Collection for this symbol is failing", on every symbol at once, about a
+    market that was simply closed.
+
+    BOTH HALVES ARE NEEDED. The same guard firing during a session is a
+    corrupted snapshot and is a failure; any other error on a closed day — a
+    symbol that has gone, a source refusing requests — is a failure too. The
+    calendar decides "closed", holidays and half-days included.
+    """
+    return (
+        bool(error_message)
+        and ZERO_OI_REFUSAL in error_message
+        and market_calendar.state_from_clock(started_at) == market_calendar.CLOSED
+    )
+
+
 def unresolvable_tickers(
     conn: psycopg.Connection, limit: int | None = None
 ) -> dict[str, datetime]:
@@ -551,21 +583,23 @@ def unresolvable_tickers(
 
     Returns {ticker: when it was suspended}, the suspending failure's own
     timestamp, so the interface can say since when rather than just "off".
+
+    A closed-market refusal does not count (`is_closed_market_refusal`): a
+    symbol whose chain arrived, zeroed overnight, exists — and a symbol added
+    on a Friday evening would otherwise be suspended by a long weekend.
     """
     threshold = config.UNRESOLVABLE_AFTER_FAILURES if limit is None else limit
     rows = conn.execute(
-        """SELECT ticker, min(started_at) FROM (
-               SELECT ticker, started_at,
-                      row_number() OVER (PARTITION BY ticker ORDER BY started_at) AS n
-               FROM collection_runs
-               WHERE status = 'failed'
-                 AND ticker NOT IN (SELECT ticker FROM collection_runs WHERE status = 'success')
-           ) ranked
-           WHERE n >= %(limit)s
-           GROUP BY ticker""",
-        {"limit": threshold},
+        """SELECT ticker, started_at, error_message FROM collection_runs
+           WHERE status = 'failed'
+             AND ticker NOT IN (SELECT ticker FROM collection_runs WHERE status = 'success')
+           ORDER BY ticker, started_at"""
     ).fetchall()
-    return {row[0].upper(): row[1] for row in rows}
+    counted: dict[str, list[datetime]] = {}
+    for ticker, started_at, message in rows:
+        if not is_closed_market_refusal(started_at, message):
+            counted.setdefault(ticker.upper(), []).append(started_at)
+    return {ticker: moments[threshold - 1] for ticker, moments in counted.items() if len(moments) >= threshold}
 
 
 def store_realized_volatility(
@@ -674,6 +708,11 @@ def collection_state(
 
     The timestamp comes back naive and is UTC by the collector's convention,
     the same as every other moment in this schema.
+
+    A closed-market refusal is not a failure (`is_closed_market_refusal`).
+    The guard's runs come back as moments rather than as a count, because
+    which of them happened with the market shut is the exchange calendar's
+    answer, not SQL's; every other failure is counted in the query.
     """
     row = conn.execute(
         """WITH last_ok AS (
@@ -681,18 +720,24 @@ def collection_state(
                FROM collection_runs
                WHERE ticker = %(ticker)s AND status = 'success'
                  AND (%(source)s::text IS NULL OR source = %(source)s::text)
+           ), since AS (
+               SELECT started_at, strpos(coalesce(error_message, ''), %(guard)s) > 0 AS guard
+                 FROM collection_runs
+                WHERE ticker = %(ticker)s AND status = 'failed'
+                  AND (%(source)s::text IS NULL OR source = %(source)s::text)
+                  AND (started_at > (SELECT at FROM last_ok) OR (SELECT at FROM last_ok) IS NULL)
            )
            SELECT (SELECT at FROM last_ok),
-                  (SELECT count(*) FROM collection_runs
-                    WHERE ticker = %(ticker)s AND status = 'failed'
-                      AND (%(source)s::text IS NULL OR source = %(source)s::text)
-                      AND (started_at > (SELECT at FROM last_ok)
-                           OR (SELECT at FROM last_ok) IS NULL))""",
-        {"ticker": ticker.upper(), "source": source},
+                  (SELECT count(*) FROM since WHERE NOT guard),
+                  (SELECT coalesce(array_agg(started_at), '{}') FROM since WHERE guard)""",
+        {"ticker": ticker.upper(), "source": source, "guard": ZERO_OI_REFUSAL},
     ).fetchone()
     if row is None:
         return None, 0
-    return row[0], int(row[1] or 0)
+    in_session = sum(
+        1 for at in row[2] or [] if not is_closed_market_refusal(at, ZERO_OI_REFUSAL)
+    )
+    return row[0], int(row[1] or 0) + in_session
 
 
 def collection_depth(conn: psycopg.Connection) -> dict[str, dt.date]:

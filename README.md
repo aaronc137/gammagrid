@@ -175,7 +175,9 @@ have caught.
 
 **A collection log full of the same failure.** Look at the message rather than
 the count. `open_interest=0` across a whole chain almost always means the
-market was shut when it ran; anything naming a symbol means that symbol.
+market was shut when it ran — those runs say "the market is closed" and are
+not counted as failures, so they never make a screen say collection is
+failing. Anything naming a symbol means that symbol.
 
 Still stuck? [Open an issue](https://github.com/gammagrid/gammagrid/issues) with
 the command you ran, everything it printed, and **the version from the bottom

@@ -43,6 +43,38 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+class ZeroOpenInterestChain(ValueError):
+    """The quality gate refused a chain whose open interest came back zeroed.
+
+    Its own type because the same refusal means two different things. During a
+    session it is a corrupted snapshot, a failure like any other. With the
+    market shut it is what Yahoo serves every night — the single snapshot the
+    worker takes on a closed day meets it routinely — and it is reported as
+    `closed:`, logged with the guard's own words so that the run log's readers
+    can tell the two apart (`db.is_closed_market_refusal`), and neither counted
+    as a failure nor towards suspending the symbol.
+    """
+
+    def __init__(self, fraction: float, market_closed: bool):
+        found = (
+            f"{fraction:.0%} {db.ZERO_OI_REFUSAL} "
+            f"(threshold {config.MAX_ZERO_OI_FRACTION:.0%})"
+        )
+        if market_closed:
+            reason = (
+                "the market is closed, and outside regular hours the data source "
+                "reports open interest as zero across most of the chain; not saving, and "
+                "not counted as a failure. The next session's collection will store it."
+            )
+        else:
+            reason = (
+                "during the session, so the data source returned a corrupted or incomplete "
+                "snapshot; not saving."
+            )
+        super().__init__(f"{found} — {reason}")
+        self.market_closed = market_closed
+
+
 def _oi_zero_fraction(chain_df: pd.DataFrame) -> float:
     """Fraction of contracts with open_interest=0 in a freshly collected
     chain. The real-world signal for detecting corrupted data-source
@@ -155,13 +187,9 @@ def collect_watchlist(
             rows_fetched = len(chain_df)
             oi_zero_fraction = _oi_zero_fraction(chain_df)
             if oi_zero_fraction > config.MAX_ZERO_OI_FRACTION:
-                raise ValueError(
-                    f"{oi_zero_fraction:.0%} of contracts have open_interest=0 "
-                    f"(threshold {config.MAX_ZERO_OI_FRACTION:.0%}) — either the data "
-                    "source returned a corrupted/incomplete snapshot, or the market is "
-                    "closed right now (Yahoo Finance commonly reports open_interest=0 "
-                    "across the whole chain outside regular trading hours); not saving. "
-                    "Try again while the market is open."
+                raise ZeroOpenInterestChain(
+                    oi_zero_fraction,
+                    market_closed=market_calendar.state_from_clock(started_at) == market_calendar.CLOSED,
                 )
             db.insert_snapshot(
                 conn, ticker, started_at, underlying_price, chain_df, source=active.name
@@ -214,6 +242,9 @@ def collect_watchlist(
                 rows_fetched=rows_fetched, oi_zero_fraction=oi_zero_fraction,
                 source=active.name,
             )
+            if isinstance(exc, ZeroOpenInterestChain) and exc.market_closed:
+                results[ticker] = f"closed: {message}"
+                continue
             results[ticker] = f"failed: {message}"
             failed_this_pass.append(ticker)
 
