@@ -74,6 +74,12 @@ touched by the move and is still the backup for those versions.)*
   It removes only day-summary rows — never a collected snapshot, which is what
   they are rebuilt from — and running it a second time finds nothing.
   `--ticker SPY` narrows it to one symbol.
+- **SPX, XSP, NDX, RUT and DJX can be added.** Nothing already collected is
+  touched. If an earlier version refused one of them, add it again; the ETF it
+  suggested (SPY, QQQ, IWM, DIA) keeps its own history and can stay. SPX is a
+  large chain — about 18,000 contracts and some 20 seconds per collection —
+  so every pass with it in the watchlist takes that much longer and stores
+  roughly twice what SPY does.
 - **Fewer failures are counted.** The collection log is not rewritten:
   runs refused because the market was closed stay `failed` with their reason,
   and are simply no longer counted towards the "collection is failing" note

@@ -35,10 +35,22 @@ CHAIN_RENAMES = {
 }
 
 
-# What these instruments are called at Yahoo, where they are index QUOTES
-# rather than option chains. Yahoo has no chain for any of them, so nothing in
-# this file collects them — but the price history behind realized volatility is
-# a different endpoint, and it answers for the caret form.
+# What these instruments are called at Yahoo: the index under a caret. The
+# chain, the spot and the price history all come from that one symbol.
+#
+# THE CARET FORM IS THE CBOE INDEX, NOT THE PUBLISHER'S QUOTE. `^GSPC` and
+# `^DJI` are the S&P 500 and the Dow as their publishers quote them, and Yahoo
+# serves no option chain under either — 0 expiries, measured on yfinance 1.7.0
+# — which is how this product once concluded that Yahoo has no index options
+# at all. Under `^SPX`, `^XSP`, `^NDX`, `^RUT` and `^DJX` it serves 53, 42, 40,
+# 28 and 12 expiries, dailies included. And `^DJI` is not even DJX's price:
+# DJX is written on one hundredth of the Dow, so the old `DJX → ^DJI` mapping
+# would have put a spot a hundred times too high under every greek.
+#
+# SPOT AND CHAIN FROM THE SAME SYMBOL, deliberately. Cboe's index quotes at
+# Yahoo are delayed about fifteen minutes, like the chain; a publisher's quote
+# can be fresher, and pricing a delayed chain against a fresher spot moves
+# every strike's moneyness by however far the index travelled in between.
 #
 # ONE TRANSLATION, IN ONE PLACE. The sibling product learned this the expensive
 # way: the map was wired into the spot lookup alone, and the price-history
@@ -47,12 +59,13 @@ CHAIN_RENAMES = {
 # returns nothing — so realized volatility was simply absent, with no symptom.
 # One translation used in one of two places is the same bug twice.
 INDEX_SYMBOLS = {
-    "SPX": "^GSPC",
+    "SPX": "^SPX",
     "XSP": "^XSP",
     "NDX": "^NDX",
     "RUT": "^RUT",
+    "DJX": "^DJX",
+    # Price history only: VIX's options are refused below.
     "VIX": "^VIX",
-    "DJX": "^DJI",
 }
 
 
@@ -67,26 +80,21 @@ class YahooProvider:
     price_history_source = "yahoo"
     requires_token = False
 
-    # WHAT YAHOO WILL NOT SERVE, AND WHAT TO OFFER INSTEAD.
+    # WHAT NOT TO ASK YAHOO FOR, AND WHAT TO OFFER INSTEAD.
     #
-    # These are not broken symbols and not typos. SPX, XSP, NDX, RUT and DJX
-    # are listed, real and heavily traded; Yahoo has no chain endpoint for a
-    # cash-settled index, which is a limitation of this source and not of the
-    # options market. Telling somebody who trades SPX that it "has no options"
-    # is plainly false, they know it is false, and it costs every other message
-    # this product prints its credibility.
+    # SPXW and NDXP are not underlyings: they are the weekly and PM-settled
+    # series of SPX and NDX options, and Yahoo serves them inside the index's
+    # own chain. Somebody who types the series root wants the index, so that is
+    # what is offered.
     #
-    # The substitutes track the same underlying, so the analytics carry over:
-    # SPY holds the S&P 500 that SPX and the mini XSP are written on, QQQ holds
-    # the Nasdaq 100 behind NDX.
-    #
-    # VIX MAPS TO NOTHING ON PURPOSE. An ETF on VIX futures is a different
-    # instrument with its own term structure, not a proxy for the index, and
-    # offering one would be worse than offering nothing.
+    # VIX IS REFUSED, AND MAPS TO NOTHING, ON PURPOSE. Yahoo does list a VIX
+    # chain, but VIX options are priced off VIX futures rather than off the
+    # index, so a model that takes the index as spot gets every greek of it
+    # wrong. And an ETF on VIX futures is a different instrument with its own
+    # term structure, not a proxy for the index — offering one would be worse
+    # than offering nothing.
     unsupported_symbols = {
-        "SPX": "SPY", "SPXW": "SPY", "XSP": "SPY",
-        "NDX": "QQQ", "NDXP": "QQQ",
-        "RUT": "IWM", "DJX": "DIA",
+        "SPXW": "SPX", "NDXP": "NDX",
         "VIX": None, "VIXW": None,
     }
     token: str | None = None  # nothing to authenticate with, nothing to scrub
@@ -154,7 +162,7 @@ class YahooProvider:
         return combined[CHAIN_COLUMNS + extras]
 
     def fetch_ticker_snapshot(self, ticker: str) -> tuple[float, pd.DataFrame]:
-        ticker_obj = yf.Ticker(ticker)
+        ticker_obj = yf.Ticker(_yahoo_symbol(ticker))
         underlying_price = with_retry(self._fetch_underlying_price, ticker_obj)
         expiries = with_retry(lambda: ticker_obj.options)
 
@@ -192,7 +200,7 @@ class YahooProvider:
         provider. A source that cannot answer simply does not offer the method.
         """
         try:
-            return bool(yf.Ticker(ticker).options)
+            return bool(yf.Ticker(_yahoo_symbol(ticker)).options)
         except Exception:  # noqa: BLE001 — every failure means "could not find out"
             return None
 

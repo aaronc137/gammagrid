@@ -147,15 +147,17 @@ the box still accepts any symbol you type. If it never arrives, check whether
 the machine can reach `cboe.com`; nothing else in the product depends on it.
 
 **"… is a real symbol with listed options, but the source does not serve its
-option chain."** For SPX, XSP, NDX, RUT, DJX and VIX, and it is not a typo:
-these are listed, heavily traded, cash-settled index options, and Yahoo has no
-chain endpoint for any of them. The message names what tracks the same
-underlying — SPY for SPX and XSP, QQQ for NDX, IWM for RUT, DIA for DJX — so
-the analytics carry over. VIX is offered nothing on purpose: an ETF on VIX
-futures is a different instrument with its own term structure, not a proxy for
-the index, and pointing you at one would be worse than saying nothing. A
-licensed data feed serves these chains; which symbols are refused is a property
-of the source, not of the market.
+option chain."** For VIX, and it is not a typo: VIX options are listed and
+heavily traded, but they are priced off VIX futures rather than off the index,
+and this source serves no futures curve to price them against — every greek
+would be wrong. It is offered nothing on purpose: an ETF on VIX futures is a
+different instrument with its own term structure, not a proxy for the index,
+and pointing you at one would be worse than saying nothing. Which symbols are
+refused is a property of the source, not of the market.
+
+**"… is a series of SPX options rather than an underlying."** SPXW and NDXP
+are the weekly and PM-settled series of SPX and NDX. They are collected inside
+the index's own chain, so add SPX or NDX instead.
 
 **A ticker in the watchlist shows ⏸ and stops collecting.** Every collection it
 has ever had failed, and none has ever succeeded — six in a row is the point at
@@ -400,11 +402,21 @@ when. Retrying through a block is what keeps a block in place.
 by retrying or by waiting: the source returns no expiries for it at all (see
 the [FAQ](#faq) for the measurement and for the ADR route).
 
-**Cash-settled index options are not served either.** SPX, XSP, NDX, RUT, DJX
-and VIX have no chain endpoint at Yahoo, however real and liquid they are. They
-are refused with the ETF that tracks the same underlying, rather than accepted
-and left to fail forever — see [When a ticker will not
+**Cash-settled index options: SPX, XSP, NDX, RUT and DJX.** Add them under
+their own names. Yahoo serves their chains under the index symbol (`^SPX`,
+`^XSP`, …), and the spot price comes from that same symbol, so the chain and
+the price it is valued against arrive delayed by about the same amount. SPX is
+the largest chain this product collects — about 18,000 contracts across some
+50 expiries, dailies included, which took 20 seconds to fetch here against 3–12
+for the others. VIX is not collected — see [When a ticker will not
 collect](#when-a-ticker-will-not-collect).
+
+**On the third Friday of the month the SPXW chain is incomplete.** That day
+has two SPX expiries at once — the monthly AM-settled SPX and the PM-settled
+SPXW — and Yahoo serves one contract per strike: the monthly one wherever it
+is listed, SPXW only at the strikes where it is not. GammaGrid stores what is
+served, so on that expiry the 0DTE picture is the monthly series' rather than
+the weeklies' wherever the two overlap. Every other day is unaffected.
 
 **Implied volatility here is ours, not Yahoo's.** The source omits it on part
 of a chain and reports figures that do not reproduce the quoted price on

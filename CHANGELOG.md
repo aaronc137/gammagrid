@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Index options: SPX, XSP, NDX, RUT and DJX now collect.** Add them under
+  their own names. Since 0.6.0 they were refused with an ETF offered instead,
+  on the finding that Yahoo has no chain for a cash-settled index — which was
+  true of the symbol that was checked, `^GSPC`, and false of the index's own
+  Cboe symbol: under `^SPX`, `^XSP`, `^NDX`, `^RUT` and `^DJX` Yahoo serves 53,
+  42, 40, 28 and 12 expiries, dailies included. The chain and the spot price
+  now come from that one symbol, so they arrive delayed alike. SPX is the
+  largest chain the product collects: 17,774 contracts fetched in 20 seconds
+  here, and its heatmap and day row build in 28 and 38 ms. Fixed on the way:
+  DJX's price lookup used the Dow itself, a hundred times DJX's level.
+  Typing the series roots SPXW or NDXP now points to SPX or NDX, whose chains
+  carry them. VIX is still not collected — its options are priced off VIX
+  futures, which this source does not serve. One limit of the source, written
+  down in the README: on the third Friday of the month Yahoo serves one
+  contract per strike, the monthly AM-settled SPX where it is listed, so that
+  day's SPXW chain is incomplete.
+
 ### Changed
 - **The interface now reads the same as the hosted version.** Same palette,
   same three corner radii, same type scale — and, the change you notice first,

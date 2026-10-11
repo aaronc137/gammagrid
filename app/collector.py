@@ -150,9 +150,9 @@ def collect_watchlist(
     # SYMBOLS THE SOURCE ITSELF REFUSES ARE NOT ASKED FOR, and this is not the
     # same thing as the suspension below. Suspension is inferred from a run of
     # failures — we conclude a symbol is hopeless. This is the provider telling
-    # us in advance, so there is nothing to infer and nothing to retry: SPX is
-    # a real, listed, heavily traded index option that Yahoo has no chain
-    # endpoint for, and asking anyway costs a request per ticker per cycle
+    # us in advance, so there is nothing to infer and nothing to retry: VIX is
+    # a real, listed, heavily traded index option that this source cannot
+    # price honestly, and asking anyway costs a request per ticker per cycle
     # against a source that limits requests, plus a failure logged against a
     # symbol that is perfectly fine.
     #

@@ -14,11 +14,12 @@ different answers possible: it distinguishes "AAPX, deliberately typed" from
 companies; and it lets somebody search for `Apple` when they do not know the
 symbol at all.
 
-WHAT IT IS NOT. It is not a statement that Yahoo will serve a chain for the
-symbol — Cboe lists SPX, XSP, NDX and RUT, and Yahoo has no chain endpoint for
-any of them. "Has listed options" and "our source will serve it" are different
-questions; the provider answers the second one (`unsupported_symbols`, and the
-live check behind the Add button).
+WHAT IT IS NOT. It is not a statement that this product will collect the
+symbol — Cboe lists VIX, whose options this source cannot price honestly, and
+the series roots SPXW and NDXP, which are collected inside SPX and NDX. "Has
+listed options" and "our source will serve it" are different questions; the
+provider answers the second one (`unsupported_symbols`, and the live check
+behind the Add button).
 
 DOWNLOADED LAZILY, THEN WEEKLY, AND NEVER BLOCKING. The first process to find
 the table empty fills it; after that the worker refreshes it on a weekly
