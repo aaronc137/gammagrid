@@ -1457,6 +1457,95 @@ def check_the_flip_is_the_crossing_by_the_money():
     print("Gamma flip picks the crossing by the money (3 crossings, deep wobble ignored)")
 
 
+def check_gamma_flip_by_depth_is_each_crop():
+    """`gamma_flip_by_depth` returns the flip of every leading block of a
+    matrix's columns in one pass; each entry must be `gamma_flip_from_matrix`
+    of that block's crop — the first d columns, the rows the mask marks — to
+    the last bit. A 20-expiry matrix with mixed signs, so the profiles cross
+    zero several times, and masks that grow the way a depth slider's do."""
+    from app import metrics_core as core
+
+    rng = np.random.default_rng(7)
+    strikes = np.arange(80.0, 120.5, 0.5)
+    expiries = list(pd.date_range("2026-10-02", periods=20, freq="7D"))
+    values = rng.normal(0.0, 1e9, size=(len(strikes), len(expiries))) * rng.random((len(strikes), 1))
+    values[rng.random(values.shape) < 0.3] = 0.0
+    matrix = pd.DataFrame(values, index=pd.Index(strikes[::-1], name="strike"), columns=expiries)
+    listed = np.zeros(len(strikes), dtype=bool)
+    masks = []
+    for _ in expiries:
+        listed = listed | (rng.random(len(strikes)) < 0.4)
+        masks.append(listed)
+    spot = 100.3
+    batch = core.gamma_flip_by_depth(matrix, np.array(masks), spot)
+    assert len(batch) == len(expiries)
+    crossings = 0
+    for depth, (mask, flip) in enumerate(zip(masks, batch), start=1):
+        one = metrics.gamma_flip_from_matrix(matrix.loc[mask, expiries[:depth]], spot)
+        assert flip == one, (depth, flip, one)
+        crossings += flip is not None
+    assert crossings >= len(expiries) // 2, "the fixture must cross zero at most depths"
+    assert core.gamma_flip_by_depth(matrix, np.array(masks), float("nan")) == [None] * len(expiries)
+    assert core.gamma_flip_by_depth(matrix.iloc[:0], np.zeros((3, 0), dtype=bool), spot) == [None] * 3
+    print(f"Gamma flip by depth: {len(expiries)} depths equal their crops")
+
+
+def check_normal_kernels_are_scipys():
+    """The core evaluates the normal CDF with `scipy.special.ndtr` and the
+    density with scipy's own expression instead of `scipy.stats.norm`, whose
+    argument checks cost more than the kernel. Every greek and every solved
+    volatility rests on these two, so they must be scipy's answers to the bit —
+    across the range, NaN, ±inf and ±0 included — and of the same type for a
+    scalar, an array and a Series."""
+    from app import metrics_core as core
+
+    grid = np.concatenate([np.linspace(-40.0, 40.0, 40001),
+                           [np.nan, np.inf, -np.inf, 0.0, -0.0, 1e-300, -1e-300]])
+    for ours, theirs in ((core._norm_cdf, norm.cdf), (core._norm_pdf, norm.pdf)):
+        assert np.array_equal(ours(grid), theirs(grid), equal_nan=True), ours.__name__
+        series = pd.Series(grid[::97])
+        got, expected = ours(series), theirs(series)
+        assert type(got) is type(expected) and np.array_equal(got, expected, equal_nan=True), ours.__name__
+        for scalar in (0.3, -2.5):
+            got, expected = ours(scalar), theirs(scalar)
+            assert type(got) is type(expected) and got == expected, (ours.__name__, scalar, got, expected)
+    print("Normal CDF and density: scipy's values and types, bit for bit")
+
+
+def check_expiry_moments_are_the_row_map():
+    """`_expiry_moments` evaluates the 16:00 New York close once per distinct
+    expiry instead of once per row; the rows must get exactly what the row map
+    gives — values, index, dtype — for every shape callers pass, and an
+    unreadable expiry must still raise."""
+    from app import metrics_core as core
+
+    def row_map(expiry):
+        return pd.to_datetime(pd.Series(expiry).map(core._expiry_moment))
+
+    shapes = [
+        pd.Series(pd.to_datetime(["2026-10-02", "2026-12-18", "2026-10-02"] * 50), index=range(10, 160)),
+        pd.Series(pd.to_datetime(["2026-10-02", "2026-11-20"]).astype("datetime64[s]")),
+        pd.Series(["2026-10-02", "2027-01-15", "2026-10-02"]),
+        pd.Series([dt.date(2026, 10, 2), dt.date(2026, 3, 20)]),
+        pd.Series([], dtype="datetime64[s]"),
+        # Not a sensible answer (year 1), but the row map's answer: this is a
+        # speed change, and what a missing expiry means is not its to decide.
+        pd.Series([pd.Timestamp("2026-10-02"), pd.NaT]),
+    ]
+    for shape in shapes:
+        got, expected = core._expiry_moments(shape), row_map(shape)
+        assert got.dtype == expected.dtype, (shape.dtype, got.dtype, expected.dtype)
+        assert got.index.equals(expected.index)
+        assert got.equals(expected), (shape.tolist()[:3], got.tolist()[:3], expected.tolist()[:3])
+    try:
+        core._expiry_moments(pd.Series(["2026-10-02", "not a date"]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unreadable expiry must raise, as the row map does")
+    print("Expiry moments per distinct expiry: same values, index and dtype as the row map")
+
+
 def check_the_strike_count_actually_decides_what_is_drawn():
     """Asking for more strikes has to return more strikes.
 
@@ -2128,6 +2217,9 @@ def main():
     check_symbols_the_source_will_not_serve_are_explained()
     check_the_batched_gex_path_returns_the_old_numbers()
     check_the_flip_is_the_crossing_by_the_money()
+    check_gamma_flip_by_depth_is_each_crop()
+    check_normal_kernels_are_scipys()
+    check_expiry_moments_are_the_row_map()
     check_the_strike_count_actually_decides_what_is_drawn()
     check_the_solver_stands_aside_where_it_should()
     check_a_stopped_collection_does_not_look_healthy()
