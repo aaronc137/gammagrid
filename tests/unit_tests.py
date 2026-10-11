@@ -1556,6 +1556,59 @@ def check_normal_kernels_are_scipys():
     print("Normal CDF and density: scipy's values and types, bit for bit")
 
 
+def check_expiry_moment_cache_changes_nothing():
+    """`_expiry_moment` is memoised — a chain maps every row through it, with a
+    few dozen distinct expiries across ten thousand rows — and the memo must be
+    invisible: the same instant for every input shape callers pass, on the
+    first call and on a repeated one, and an input that raises must keep
+    raising rather than being remembered.
+
+    THE MEMO IS KEYED BY THE CALENDAR DATE, not by the caller's value. Two
+    tz-aware timestamps of one instant are equal and hash alike while naming
+    different dates — 23:30 in New York is 03:30 the next day in UTC — and a
+    memo keyed by the value answered the second with the first one's close: a
+    time to expiry a day off, depending only on which was asked first.
+
+    A MISSING EXPIRY HAS NO MOMENT. None, NaN and NaT give NaT, so the time
+    left is NaN like any other missing input. They used to place the close in
+    year 1 and price the contract as expired two thousand years ago.
+    """
+    from app import metrics_core as core
+
+    def compute(expiry):
+        return core._close_of.__wrapped__(pd.Timestamp(expiry).date())
+
+    for expiry in (pd.Timestamp("2026-10-02").date(), pd.Timestamp("2026-12-18"), "2027-01-15"):
+        for _ in range(2):
+            assert core._expiry_moment(expiry) == compute(expiry), expiry
+    as_of = pd.Timestamp("2026-09-29 14:30")
+    chain = pd.Series([pd.Timestamp("2026-10-02"), pd.Timestamp("2026-12-18")] * 500)
+    years = core.years_to_expiry_series(chain, as_of)
+    expected = [(compute(e) - as_of).total_seconds() / core._YEAR_SECONDS for e in chain]
+    assert list(years) == expected
+    for _ in range(2):
+        try:
+            core._expiry_moment("not a date")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a bad expiry must keep raising, not be remembered")
+
+    late_ny = pd.Timestamp("2026-10-16 23:30", tz="America/New_York")
+    same_utc = pd.Timestamp("2026-10-17 03:30", tz="UTC")
+    for pair in ((late_ny, same_utc), (same_utc, late_ny)):
+        core._close_of.cache_clear()
+        got = {str(stamp): core._expiry_moment(stamp) for stamp in pair}
+        assert got == {
+            str(late_ny): pd.Timestamp("2026-10-16 20:00"),
+            str(same_utc): pd.Timestamp("2026-10-17 20:00"),
+        }, f"one instant, two dates, each its own close: {got}"
+    for missing in (None, float("nan"), pd.NaT):
+        assert core._expiry_moment(missing) is pd.NaT, missing
+        assert pd.isna(core.years_to_expiry(missing, as_of)), missing
+    print("Expiry moment cache: same instants, bad input still raises, tz-aware and missing expiries")
+
+
 def check_expiry_moments_are_the_row_map():
     """`_expiry_moments` evaluates the 16:00 New York close once per distinct
     expiry instead of once per row; the rows must get exactly what the row map
@@ -1572,8 +1625,7 @@ def check_expiry_moments_are_the_row_map():
         pd.Series(["2026-10-02", "2027-01-15", "2026-10-02"]),
         pd.Series([dt.date(2026, 10, 2), dt.date(2026, 3, 20)]),
         pd.Series([], dtype="datetime64[s]"),
-        # Not a sensible answer (year 1), but the row map's answer: this is a
-        # speed change, and what a missing expiry means is not its to decide.
+        # A missing expiry has no moment (NaT), exactly as the row map says.
         pd.Series([pd.Timestamp("2026-10-02"), pd.NaT]),
     ]
     for shape in shapes:
@@ -2437,6 +2489,7 @@ def main():
     check_the_flip_is_the_crossing_by_the_money()
     check_gamma_flip_by_depth_is_each_crop()
     check_normal_kernels_are_scipys()
+    check_expiry_moment_cache_changes_nothing()
     check_expiry_moments_are_the_row_map()
     check_the_strike_count_actually_decides_what_is_drawn()
     check_the_solver_stands_aside_where_it_should()
