@@ -2082,6 +2082,105 @@ def check_the_day_row_and_the_ladder():
     print("day-row and ladder checks passed (the day rule, one expiry, the first day, the regime)")
 
 
+def check_a_day_is_a_session_that_opened():
+    """One rule for every reader of a day: a collection counts as its day only
+    once that day's session had opened.
+
+    The worker takes one snapshot on a closed day — a weekend, a holiday, and
+    just after midnight on any day — and each of those used to become a day of
+    its own: Changes compared Saturday with Sunday, Labor Day sat in the
+    history as a trading day, and before the open OI Delta compared last
+    night's chain with yesterday's and read zero everywhere. All on September
+    2026's real calendar (Labor Day is Monday the 7th), stated in UTC.
+
+    Then the rows an older build already wrote: every reader must ignore them,
+    and the cleanup must remove exactly those, report the same count dry, and
+    find nothing the second time.
+    """
+    from app import day_summary
+    from app import market_calendar as mc
+
+    friday = dt.datetime(2026, 9, 4, 19, 45)        # 15:45 New York
+    saturday = dt.datetime(2026, 9, 5, 16, 0)       # weekend
+    sunday = dt.datetime(2026, 9, 6, 16, 0)         # weekend
+    labor_day = dt.datetime(2026, 9, 7, 4, 26)      # 00:26 New York, a holiday
+    tuesday_night = dt.datetime(2026, 9, 8, 4, 14)  # 00:14 New York, before the open
+    tuesday = dt.datetime(2026, 9, 8, 19, 45)
+    wednesday_night = dt.datetime(2026, 9, 9, 4, 14)  # the day's only collection
+    thursday = dt.datetime(2026, 9, 10, 19, 45)
+    late_friday = dt.datetime(2026, 9, 12, 1, 15)   # Friday 21:15 New York: Friday's, after the close
+
+    assert mc._exchange_calendar() is not None, "the checks run with the exchange calendar installed"
+    opened = {friday, tuesday, thursday, late_friday}
+    for moment in (friday, saturday, sunday, labor_day, tuesday_night, tuesday,
+                   wednesday_night, thursday, late_friday):
+        assert mc.session_started(moment) == (moment in opened), moment
+        assert day_summary.is_session_snapshot(moment) == (moment in opened), moment
+    # A half-day counts from its open, and after its 13:00 close it still counts.
+    assert mc.session_started(dt.datetime(2026, 11, 27, 19, 0))
+    assert not mc.session_started(dt.datetime(2026, 11, 26, 19, 0)), "Thanksgiving"
+    # And "the last completed trading day" agrees: on the Tuesday after Labor
+    # Day it is Friday, or the volume baseline built through Friday looks stale
+    # and is rebuilt on every pass of the day.
+    assert mc.last_completed_trading_day(tuesday) == dt.date(2026, 9, 4)
+    assert mc.last_completed_trading_day(thursday) == dt.date(2026, 9, 9)
+
+    # The row itself: a closed day makes none, whatever the chain looks like.
+    expiry = _future_friday()
+    for moment in (saturday, labor_day, tuesday_night):
+        chain = _day_chain(moment, 100.0, expiry)
+        assert day_summary.summarize(chain, metrics.DEFAULT_PRICING, metrics.gamma_weather(chain)) is None, moment
+
+    conn = db.get_connection()
+    ticker, source = "SESSCHK", "yahoo"
+
+    # The per-day moment list behind OI Delta and the volume baseline.
+    for moment in (friday, saturday, labor_day, tuesday_night, tuesday, wednesday_night):
+        db.log_run(conn, moment, moment + dt.timedelta(seconds=20), ticker, "success",
+                   rows_fetched=10, source=source)
+    per_day = db.get_collection_moments(conn, ticker, days=None, per_day=True, source=source)
+    assert per_day == [tuesday, friday], per_day
+
+    # Rows an older build wrote: built for a real session, then filed the way
+    # the old rule filed them.
+    def stale(day, at):
+        chain = _day_chain(friday, 100.0, expiry)
+        row = day_summary.summarize(chain, metrics.DEFAULT_PRICING, metrics.gamma_weather(chain))
+        row.update(day=day, collected_at=at)
+        db.upsert_day_summary(conn, ticker, source, row, day_summary.CODE_SHA)
+
+    stale(dt.date(2026, 9, 4), friday)
+    stale(dt.date(2026, 9, 5), saturday)
+    stale(dt.date(2026, 9, 6), sunday)
+    stale(dt.date(2026, 9, 7), labor_day)
+    stale(dt.date(2026, 9, 9), wednesday_night)
+    stale(dt.date(2026, 9, 10), thursday)
+    stale(dt.date(2026, 9, 12), late_friday)  # filed under the UTC date: a Saturday
+
+    assert db.list_day_summaries(conn, ticker, source) == [dt.date(2026, 9, 10), dt.date(2026, 9, 4)]
+    assert db.get_day_summary(conn, ticker, source)["day"] == dt.date(2026, 9, 10)
+    assert db.get_day_summary(conn, ticker, source, dt.date(2026, 9, 5)) is None
+    assert db.previous_day_summary(conn, ticker, source, dt.date(2026, 9, 10))["day"] == dt.date(2026, 9, 4)
+
+    # Tuesday has a session collection and no row; the closed days are not offered.
+    assert db.missing_day_summaries(conn, ticker, source, 100000, day_summary.CODE_SHA) == [tuesday]
+
+    assert db.drop_non_session_day_summaries(conn, [ticker], dry_run=True) == 5
+    assert conn.execute("SELECT count(*) FROM ticker_day_summary WHERE ticker = %s", (ticker,)).fetchone()[0] == 7
+    assert db.drop_non_session_day_summaries(conn, [ticker]) == 5
+    assert db.drop_non_session_day_summaries(conn, [ticker]) == 0, "a second run must find nothing"
+    left = conn.execute(
+        "SELECT day FROM ticker_day_summary WHERE ticker = %s ORDER BY day DESC", (ticker,)
+    ).fetchall()
+    assert [r[0] for r in left] == [dt.date(2026, 9, 10), dt.date(2026, 9, 4)], left
+
+    conn.execute("DELETE FROM ticker_day_summary WHERE ticker = %s", (ticker,))
+    conn.execute("DELETE FROM collection_runs WHERE ticker = %s", (ticker,))
+    conn.commit()
+    conn.close()
+    print("session-day checks passed (weekend, holiday, before the open, stale rows and their cleanup)")
+
+
 def check_day_summaries_are_written_and_filled_in():
     """The rows reach the database, and the gaps fill themselves in.
 
@@ -2136,10 +2235,18 @@ def check_day_summaries_are_written_and_filled_in():
     # Now the real path: snapshots plus a run log, and the backfill reading
     # them. A day nothing was collected on simply has no row to build.
     backfill_ticker = "DAYFILL"
-    today = dt.datetime.utcnow().replace(microsecond=0)
-    at = today - dt.timedelta(days=1)
-    while at.isoweekday() > 5:
-        at -= dt.timedelta(days=1)
+    # A moment inside the last full session, found with the calendar: a day
+    # only counts once its session has opened, so "yesterday at this hour"
+    # would be a holiday on some days and before the open at some hours.
+    from app import market_calendar
+
+    day = dt.date.today() - dt.timedelta(days=1)
+    while market_calendar.session_times(day)[0] is None:
+        day -= dt.timedelta(days=1)
+    at = (
+        dt.datetime.combine(day, dt.time(15, 0), tzinfo=market_calendar.MARKET_TZ)
+        .astimezone(dt.timezone.utc).replace(tzinfo=None)
+    )
     chain = _day_chain(at, 100.0, expiry)
     db.insert_snapshot(
         conn, backfill_ticker, at, 100.0,
@@ -2226,6 +2333,7 @@ def main():
     check_the_run_log_answers_how_collection_is_going()
     check_realized_volatility_is_stored_once_a_day_and_read_back()
     check_the_day_row_and_the_ladder()
+    check_a_day_is_a_session_that_opened()
     check_day_summaries_are_written_and_filled_in()
     print("\nALL UNIT CHECKS PASSED")
 

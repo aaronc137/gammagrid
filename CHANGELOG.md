@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   what a chain comes back as; with an open range the same commit collected
   differently depending on the day its image was built.
 
+### Fixed
+- **Changes, OI Delta and the Unusual Activity baseline no longer count a day
+  the market did not trade.** With the market closed the collector takes one
+  snapshot a day as a safety net — on weekends, on exchange holidays, and just
+  after midnight New York on any day — and each of those became a day of its
+  own: Changes could compare Saturday with Sunday and present the source's
+  weekend re-pricing as a day's change, Labor Day sat in the history as a
+  trading day, and before the opening bell OI Delta compared last night's
+  snapshot with yesterday's and read zero on every row, because open interest
+  is not refreshed overnight. There is now one rule for all of them: a day
+  counts once its session has opened, by the exchange calendar — so on a
+  Monday the day before is Friday, and before 09:30 New York "today" is still
+  the last session. Rows an older version already wrote for such days are
+  ignored everywhere; `python -m app.day_summary --drop-non-session-days`
+  removes them from the database if you want the table to say the same (see
+  UPGRADING.md).
+
 ## [0.7.0] - 2026-09-19
 
 ### Added

@@ -1045,8 +1045,9 @@ def get_collection_moments(
     size of the answer — measured on the hosted product at 946 ms to read 3.26M
     index entries and return 247 values.
 
-    `per_day=True` returns the last collection of each calendar day, which is
-    what every metric built on daily history actually uses.
+    `per_day=True` returns the last collection of each trading day, which is
+    what every metric built on daily history actually uses — and only of days
+    whose session had opened by then (`market_calendar.session_started`).
 
     Scoped to one source like every other read. A run recorded before the
     source column existed reads as 'yahoo', which is what it was.
@@ -1086,7 +1087,16 @@ def get_collection_moments(
             SELECT started_at FROM collection_runs WHERE {where}
             ORDER BY started_at DESC
         """
-    return [row[0] for row in conn.execute(statement, params).fetchall()]  # noqa: S608
+    moments = [row[0] for row in conn.execute(statement, params).fetchall()]  # noqa: S608
+    if per_day:
+        # The rest of the day rule, in Python because it needs the exchange
+        # calendar: SQL can drop a Saturday, but only the calendar knows Labor
+        # Day, and only the clock knows that a day whose last collection is
+        # 00:14 in New York had not traded yet. The DAY is dropped rather than
+        # an earlier collection reached for — DISTINCT ON already took the
+        # last one, so if that was before the open, every one of them was.
+        moments = [moment for moment in moments if market_calendar.session_started(moment)]
+    return moments
 
 
 def get_snapshots_at(
@@ -1479,49 +1489,106 @@ def upsert_day_summary(
     conn.commit()
 
 
-def get_day_summary(
-    conn: psycopg.Connection, ticker: str, source: str, day: dt.date | None = None
-) -> dict | None:
-    """The row for one day — the newest day when None — or None."""
-    filter_day = "AND day = %(day)s" if day is not None else ""
+def _is_session_day_row(day: dt.date, collected_at) -> bool:
+    """Whether a stored day row describes a session that had opened.
+
+    Two ways to fail, and rows written before this rule existed show both: the
+    collection came before that day's open (a weekend, a holiday, the 00:1x
+    snapshot of a closed market), or the row is filed under a day that is not
+    its collection's own New York day.
+    """
+    return market_calendar.session_started(collected_at) and market_calendar.market_day(collected_at) == day
+
+
+def _session_days(conn: psycopg.Connection, ticker: str, source: str) -> list[dt.date]:
+    """The days on record that are trading days, newest first.
+
+    Filtered on read rather than trusted, so that rows an older build wrote for
+    a Saturday or a holiday are simply not there for any view — the cleanup
+    command removes them, but nothing depends on it having been run. The rule
+    needs the exchange calendar, so it is applied here and not in SQL; it reads
+    two narrow columns, a few hundred rows at most.
+    """
+    rows = conn.execute(
+        """SELECT day, collected_at FROM ticker_day_summary
+            WHERE ticker = %(ticker)s AND source = %(source)s
+            ORDER BY day DESC""",
+        {"ticker": ticker.upper(), "source": source},
+    ).fetchall()
+    return [day for day, collected_at in rows if _is_session_day_row(day, collected_at)]
+
+
+def _day_summary_on(conn: psycopg.Connection, ticker: str, source: str, day: dt.date) -> dict | None:
     record = conn.execute(
         f"""SELECT {", ".join(_DAY_SUMMARY_COLUMNS)} FROM ticker_day_summary
-             WHERE ticker = %(ticker)s AND source = %(source)s {filter_day}
-             ORDER BY day DESC LIMIT 1""",  # noqa: S608 — the filter is a fixed string
+             WHERE ticker = %(ticker)s AND source = %(source)s AND day = %(day)s""",  # noqa: S608 — constant columns
         {"ticker": ticker.upper(), "source": source, "day": day},
     ).fetchone()
     return None if record is None else _day_summary_row(record)
 
 
+def get_day_summary(
+    conn: psycopg.Connection, ticker: str, source: str, day: dt.date | None = None
+) -> dict | None:
+    """The row for one trading day — the newest when None — or None."""
+    days = _session_days(conn, ticker, source)
+    if day is None:
+        return _day_summary_on(conn, ticker, source, days[0]) if days else None
+    return _day_summary_on(conn, ticker, source, day) if day in days else None
+
+
 def previous_day_summary(
     conn: psycopg.Connection, ticker: str, source: str, before: dt.date
 ) -> dict | None:
-    """The newest row strictly before a day.
+    """The newest trading day's row strictly before a day.
 
-    "The previous trading day" as the table knows it, which skips weekends,
-    holidays and days nothing was collected without consulting a calendar —
-    the row exists or it does not.
+    "The previous trading day" as the table knows it: weekends, holidays and
+    days nothing was collected on are skipped because no session row exists
+    for them — a row filed for one by an older build is not one.
     """
-    record = conn.execute(
-        f"""SELECT {", ".join(_DAY_SUMMARY_COLUMNS)} FROM ticker_day_summary
-             WHERE ticker = %(ticker)s AND source = %(source)s AND day < %(before)s
-             ORDER BY day DESC LIMIT 1""",  # noqa: S608 — the column list is a constant
-        {"ticker": ticker.upper(), "source": source, "before": before},
-    ).fetchone()
-    return None if record is None else _day_summary_row(record)
+    earlier = [day for day in _session_days(conn, ticker, source) if day < before]
+    return _day_summary_on(conn, ticker, source, earlier[0]) if earlier else None
 
 
 def list_day_summaries(
     conn: psycopg.Connection, ticker: str, source: str, limit: int = 400
 ) -> list[dt.date]:
-    """The days on record, newest first — what the two date pickers offer."""
+    """The trading days on record, newest first — what the two date pickers offer."""
+    return _session_days(conn, ticker, source)[:limit]
+
+
+def drop_non_session_day_summaries(
+    conn: psycopg.Connection, tickers: list[str] | None = None, *, dry_run: bool = False
+) -> int:
+    """Delete the day rows of days whose session had not opened. Returns how
+    many rows went — or would go, under `dry_run`.
+
+    For rows an older build wrote: before the day rule asked the exchange
+    calendar, the worker filed a row for any day it collected on, including
+    the single snapshot it takes on a weekend, a holiday, and just after
+    midnight. Every reader already ignores them (`_session_days`); this makes
+    the table say what the views say. Run it twice and the second run finds
+    nothing — the backfill applies the same rule, so it does not put them back.
+
+    NOT SCOPED BY SOURCE, unlike every read in this file: a holiday is a holiday
+    whichever provider collected it, and a row left behind under the other
+    source would reappear the day it is switched back on. `tickers` narrows it.
+    """
+    where, params = "", {}
+    if tickers is not None:
+        where = " WHERE ticker = ANY(%(tickers)s)"
+        params["tickers"] = [t.upper() for t in tickers]
     rows = conn.execute(
-        """SELECT day FROM ticker_day_summary
-            WHERE ticker = %(ticker)s AND source = %(source)s
-            ORDER BY day DESC LIMIT %(limit)s""",
-        {"ticker": ticker.upper(), "source": source, "limit": limit},
+        f"SELECT ticker, source, day, collected_at FROM ticker_day_summary{where}", params  # noqa: S608
     ).fetchall()
-    return [r[0] for r in rows]
+    doomed = [(ticker, source, day) for ticker, source, day, at in rows if not _is_session_day_row(day, at)]
+    if dry_run or not doomed:
+        return len(doomed)
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            "DELETE FROM ticker_day_summary WHERE ticker = %s AND source = %s AND day = %s", doomed
+        )
+    return len(doomed)
 
 
 def get_moment_rollup(
@@ -1571,4 +1638,6 @@ def missing_day_summaries(
              ORDER BY p.started_at DESC""",  # noqa: S608 — the date expressions are constants
         {"ticker": ticker.upper(), "source": source, "days": days, "sha": core_sha},
     ).fetchall()
-    return [r[0] for r in rows]
+    # The same rule `get_collection_moments(per_day=True)` applies: a day the
+    # exchange had not opened is not a day to build a row for.
+    return [r[0] for r in rows if market_calendar.session_started(r[0])]

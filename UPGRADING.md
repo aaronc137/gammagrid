@@ -55,8 +55,25 @@ touched by the move and is still the backup for those versions.)*
   version of the formulas produced it, and this release changes the
   calculation code (for speed — every number comes out identical). Rows built
   by the older code are rebuilt from the stored snapshots at the worker's next
-  start, up to 45 days back, exactly as on the upgrade to v0.7.0 — at roughly
-  a third of that release's cost per ticker-day.
+  start, up to 45 days back, exactly as on the upgrade to v0.7.0 — at under
+  half of that release's cost per ticker-day.
+- **Changes may offer fewer days than before.** A day now counts only once
+  its session has opened (weekends, exchange holidays and the snapshot the
+  collector takes overnight before the open are not days), and the rows an
+  older version wrote for such days are skipped when read — nothing is
+  deleted by the upgrade itself, and going back to v0.7.0 shows them again.
+  To remove them from the table as well, look first, then delete:
+
+  ```bash
+  docker compose run --rm --no-deps worker \
+      python -m app.day_summary --drop-non-session-days --dry-run
+  docker compose run --rm --no-deps worker \
+      python -m app.day_summary --drop-non-session-days
+  ```
+
+  It removes only day-summary rows — never a collected snapshot, which is what
+  they are rebuilt from — and running it a second time finds nothing.
+  `--ticker SPY` narrows it to one symbol.
 
 ## v0.6.1 → v0.7.0
 
