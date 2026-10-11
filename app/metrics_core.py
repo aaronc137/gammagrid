@@ -222,18 +222,33 @@ _YEAR_SECONDS = 365 * 24 * 3600
 
 
 @functools.lru_cache(maxsize=4096)
-def _expiry_moment(expiry) -> pd.Timestamp:
-    """The instant a contract actually stops trading, as naive UTC.
+def _close_of(date: dt.date) -> pd.Timestamp:
+    """16:00 New York on `date`, as naive UTC.
 
     Memoised because the callers map every row of a chain through it, and a
     chain of ten thousand rows carries only a few dozen distinct expiries: the
     timezone arithmetic below was a quarter of a cold GEX heatmap build,
-    repeated for answers already known. The result is an immutable Timestamp,
-    so sharing it is safe, and an input that raises is not remembered — it
-    raises again on the next call, exactly as before."""
-    date = pd.Timestamp(expiry).date()
+    repeated for answers already known. Keyed by the calendar date, not by the
+    caller's value: two tz-aware timestamps of the same instant in different
+    zones are equal and hash alike, yet name different calendar dates, so a
+    cache keyed by the timestamp answered the second with the first one's
+    close — a day off, depending on call order."""
     local = dt.datetime.combine(date, EXPIRY_CLOSE_ET, tzinfo=EXPIRY_TZ)
     return pd.Timestamp(local.astimezone(dt.timezone.utc)).tz_localize(None)
+
+
+def _expiry_moment(expiry) -> pd.Timestamp:
+    """The instant a contract actually stops trading, as naive UTC.
+
+    The date is read in the expiry's own zone. A missing expiry (None, NaN,
+    NaT) has no moment and gives NaT, so the time left is NaN like any other
+    missing input — `NaT.date()` does not raise, and combining it with New
+    York used to place the close in year 1 and price the contract as long
+    expired."""
+    stamp = pd.Timestamp(expiry)
+    if pd.isna(stamp):
+        return pd.NaT
+    return _close_of(stamp.date())
 
 
 def _as_naive_utc(moment) -> pd.Timestamp:

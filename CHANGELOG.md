@@ -50,7 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   16:00 New York close of each expiry was worked out once per contract rather
   than once per expiry, and the normal distribution was evaluated through a
   wrapper whose argument checks cost more than the arithmetic. The shared
-  calculation core is back in step with the hosted version's.
+  calculation core is back in step with the hosted version's, including two
+  edge cases in the time to expiry that nothing this application stores can
+  reach, fixed anyway because the core is a library: an expiry with no date
+  now gives no time to expiry instead of one two thousand years in the past,
+  and two time-zone-aware expiries naming one instant on different dates are
+  no longer given the same close.
 - **`yfinance` is pinned to 1.7.0** instead of "0.2.40 or anything newer".
   It is an unofficial wrapper around a website, and a new release can change
   what a chain comes back as; with an open range the same commit collected
