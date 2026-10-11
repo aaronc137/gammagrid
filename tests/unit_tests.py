@@ -198,7 +198,18 @@ def check_collector_isolation():
                 raise RuntimeError("provider exploded")
             return 100.0, chain(zero_oi=(ticker == "ZEROOI"))
 
-    results = collector.collect_watchlist(conn, ["GOOD", "BOOM", "ZEROOI"], provider=Fake())
+    # On a Wednesday at 11:00 New York, so that the zero-OI refusal is the
+    # in-session kind whatever the clock says when the suite runs.
+    real_now = collector._now_utc
+    collector._now_utc = lambda: datetime(2026, 9, 16, 15, 0)
+    try:
+        results = collector.collect_watchlist(conn, ["GOOD", "BOOM", "ZEROOI"], provider=Fake())
+        # The same chain on a Saturday: refused just the same, and said to be the
+        # market being shut rather than a failure.
+        collector._now_utc = lambda: datetime(2026, 9, 19, 16, 0)
+        closed = collector.collect_watchlist(conn, ["ZEROOI"], provider=Fake())
+    finally:
+        collector._now_utc = real_now
 
     assert results["GOOD"] == "success", results
     assert results["BOOM"].startswith("failed"), results
@@ -207,6 +218,8 @@ def check_collector_isolation():
     # looks ordinary but silently breaks the GEX heatmap and OI delta.
     assert results["ZEROOI"].startswith("failed"), results
     assert "open_interest=0" in results["ZEROOI"], results["ZEROOI"]
+    assert closed["ZEROOI"].startswith("closed: "), closed
+    assert db.ZERO_OI_REFUSAL in closed["ZEROOI"], closed
     assert len(db.get_snapshots(conn, "GOOD", days=None)) == 2
     assert db.get_snapshots(conn, "ZEROOI", days=None).empty, "a refused snapshot must not be stored"
     # Every attempt is logged, successful or not — the collection log is the
@@ -1786,6 +1799,73 @@ def check_a_stopped_collection_does_not_look_healthy():
     print("freshness checks passed (resting, stale, failing, and the bell-minute trap)")
 
 
+def check_a_closed_market_is_not_a_failure():
+    """The zero-open-interest refusal on a closed market is an outcome, not a
+    failure — and nothing else is excused.
+
+    Outside regular hours Yahoo serves chains with open interest zeroed on most
+    contracts, and the guard rightly refuses them. The worker takes one
+    snapshot on each closed day, so Saturday, Sunday and Monday before the open
+    made three refusals in a row — the threshold at which every screen says
+    "Collection for this symbol is failing", for every symbol, about a market
+    that was shut. Classified on read, so the rows already in a run log come
+    out right too: the legacy wording is in this fixture alongside the new one.
+    """
+    from app import collector, config, freshness
+
+    conn = db.get_connection()
+    ticker = "CLOSEDCHK"
+    friday = dt.datetime(2026, 9, 11, 19, 45)  # 15:45 New York
+    legacy = (
+        "93% of contracts have open_interest=0 (threshold 50%) — either the data source returned "
+        "a corrupted/incomplete snapshot, or the market is closed right now; not saving."
+    )
+    current = str(collector.ZeroOpenInterestChain(0.93, market_closed=True))
+
+    def run(status, at, message=None, who=ticker):
+        db.log_run(conn, at, at + dt.timedelta(seconds=20), who, status, message, source="yahoo")
+
+    run("success", friday)
+    run("failed", dt.datetime(2026, 9, 12, 4, 14), legacy)   # Saturday 00:14 New York
+    run("failed", dt.datetime(2026, 9, 13, 4, 14), current)  # Sunday
+    run("failed", dt.datetime(2026, 9, 14, 4, 14), current)  # Monday, before the open
+    assert db.collection_state(conn, ticker) == (friday, 0)
+    monday_morning = dt.datetime(2026, 9, 14, 12, 0, tzinfo=dt.timezone.utc)  # 08:00 New York
+    verdict = freshness.assess(friday, 0, 15, now=monday_morning)
+    assert verdict is not None and verdict[0] == freshness.RESTING, verdict
+
+    # The same refusal inside the session is a failure, and so is anything
+    # else on a closed day: being limited by the source on a Saturday is real.
+    run("failed", dt.datetime(2026, 9, 12, 16, 0), "the data source is limiting requests")
+    run("failed", dt.datetime(2026, 9, 14, 14, 0), current)  # Monday 10:00 New York
+    run("failed", dt.datetime(2026, 9, 14, 14, 15), "no price for CLOSEDCHK")
+    assert db.collection_state(conn, ticker) == (friday, 3)
+    later = dt.datetime(2026, 9, 14, 14, 20, tzinfo=dt.timezone.utc)
+    assert freshness.assess(friday, 3, 15, now=later)[0] == freshness.FAILING
+
+    # A holiday is closed by the calendar, not by the weekday: Labor Day noon.
+    assert db.is_closed_market_refusal(dt.datetime(2026, 9, 7, 16, 0), current)
+    assert not db.is_closed_market_refusal(dt.datetime(2026, 9, 8, 16, 0), current)
+    assert not db.is_closed_market_refusal(dt.datetime(2026, 9, 7, 16, 0), "no price for X")
+
+    # Suspension reads the same rule: a symbol whose chain keeps arriving
+    # zeroed over a long weekend exists, and is not tidied away.
+    fresh = "NEWCLOSED"
+    for night in range(config.UNRESOLVABLE_AFTER_FAILURES + 2):
+        run("failed", dt.datetime(2026, 9, 5, 4, 14) + dt.timedelta(days=night), current, who=fresh)
+    assert fresh not in db.unresolvable_tickers(conn)
+    for minute in range(config.UNRESOLVABLE_AFTER_FAILURES):
+        run("failed", dt.datetime(2026, 9, 15, 15, minute), "no price for NEWCLOSED", who=fresh)
+    assert db.unresolvable_tickers(conn).get(fresh) == dt.datetime(
+        2026, 9, 15, 15, config.UNRESOLVABLE_AFTER_FAILURES - 1
+    )
+
+    conn.execute("DELETE FROM collection_runs WHERE ticker IN (%s, %s)", (ticker, fresh))
+    conn.commit()
+    conn.close()
+    print("closed-market checks passed (the weekend is quiet, a session failure still counts)")
+
+
 def check_the_run_log_answers_how_collection_is_going():
     """Last success and failures SINCE it, read in one query and per source.
 
@@ -2331,6 +2411,7 @@ def main():
     check_the_solver_stands_aside_where_it_should()
     check_a_stopped_collection_does_not_look_healthy()
     check_the_run_log_answers_how_collection_is_going()
+    check_a_closed_market_is_not_a_failure()
     check_realized_volatility_is_stored_once_a_day_and_read_back()
     check_the_day_row_and_the_ladder()
     check_a_day_is_a_session_that_opened()

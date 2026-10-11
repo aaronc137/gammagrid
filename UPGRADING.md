@@ -74,6 +74,11 @@ touched by the move and is still the backup for those versions.)*
   It removes only day-summary rows — never a collected snapshot, which is what
   they are rebuilt from — and running it a second time finds nothing.
   `--ticker SPY` narrows it to one symbol.
+- **Fewer failures are counted.** The collection log is not rewritten:
+  runs refused because the market was closed stay `failed` with their reason,
+  and are simply no longer counted towards the "collection is failing" note
+  or towards suspending a symbol. If a symbol is currently suspended only
+  because of overnight refusals, it is retried on the next pass.
 
 ## v0.6.1 → v0.7.0
 

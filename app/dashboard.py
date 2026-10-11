@@ -664,7 +664,7 @@ with st.sidebar:
         disabled=not watchlist,
         help="Best run while the US options market is open. Outside market "
         "hours, Yahoo Finance often reports open_interest=0 across the whole "
-        "chain, which fails the collection for that ticker.",
+        "chain; such a chain is not stored, and is not counted as a failure.",
     ):
         with st.spinner("Collecting data..."):
             results = collector.collect_watchlist(conn, watchlist)
@@ -675,6 +675,10 @@ with st.sidebar:
                 # A deliberate decision not to try is not an error, and dressing
                 # it in red teaches people to ignore the red.
                 st.warning(f"{ticker}: {status}")
+            elif status.startswith("closed"):
+                # Nor is the market being shut: the chain arrived, zeroed the way
+                # the source serves it outside hours, and was not stored.
+                st.info(f"{ticker}: {status}")
             else:
                 st.error(f"{ticker}: {status}")
 
@@ -779,7 +783,9 @@ with st.sidebar:
             "even if the request to the data source itself completed without a network error. "
             "The most common cause is collecting outside regular market hours — Yahoo Finance "
             "often reports open_interest=0 across the whole chain while the market is closed. "
-            "If a ticker keeps failing, try again during market hours."
+            "Those runs say so in `error_message` and are not counted as failures: they do not "
+            "raise the \"collection is failing\" note or suspend a symbol. The same refusal "
+            "during a session is a real failure."
         )
 
     st.divider()

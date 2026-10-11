@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ignored everywhere; `python -m app.day_summary --drop-non-session-days`
   removes them from the database if you want the table to say the same (see
   UPGRADING.md).
+- **"Collection for this symbol is failing" no longer appears after a
+  weekend or a holiday.** Outside regular hours Yahoo serves chains with open
+  interest zeroed on most contracts, and the quality check rightly refuses to
+  store them — but each refusal counted as a failure, and the one snapshot the
+  collector takes on each closed day made three in a row by Monday morning:
+  the banner, on every symbol at once, about a market that was shut. Such a
+  refusal is now reported as the market being closed: it is still in the
+  collection log with its reason, but it neither counts towards the banner nor
+  towards suspending a symbol. The same refusal during a session, and any
+  other error on any day, still counts. Runs already in your log are read the
+  same way — on the log collected while writing this, 44 of 57 recorded
+  failures were this.
 
 ## [0.7.0] - 2026-09-19
 
