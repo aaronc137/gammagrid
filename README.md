@@ -250,7 +250,7 @@ And, because every snapshot is kept:
    - **Contract** — price, IV, and greeks history for a specific contract, with pinning
    - **Screener** — every contract of the latest snapshot with greeks and range filters
    - **Unusual Activity** — contracts with anomalous volume in the latest snapshot
-   - **OI Delta** — open interest change between the two latest calendar days
+   - **OI Delta** — open interest change between the two latest trading days
 
 Most history-based metrics (other than Put/Call Ratio, average IV, and OI
 Delta) need several days of collection — some charts require at least two

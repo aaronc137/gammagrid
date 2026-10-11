@@ -90,11 +90,19 @@ def last_completed_trading_day(moment: dt.datetime | None = None) -> dt.date:
     "yesterday" is Sunday, which was never collected — so a baseline built
     through Friday looks stale, gets rebuilt on every pass, and produces the
     same numbers each time. Weekends made it every cycle for two days.
+
+    Holidays are skipped too, by the exchange calendar where it is installed:
+    the per-day readers no longer count a holiday as a day (`session_started`),
+    so the Tuesday after Labor Day has Friday as its last completed session,
+    and a "Monday" here would make a baseline built through Friday look stale
+    all day.
     """
     day = market_day(moment) - dt.timedelta(days=1)
-    while day.isoweekday() > 5:
+    for _ in range(14):  # a long holiday weekend and then some, and still bounded
+        if session_times(day)[0] is not None:
+            return day
         day -= dt.timedelta(days=1)
-    return day
+    raise RuntimeError("no trading day found within two weeks")  # unreachable
 
 
 # The exchange's own calendar, if it is installed.
@@ -175,6 +183,32 @@ def session_times(day: dt.date):
     if day.isoweekday() > 5:
         return None, None
     return OPEN_TIME, CLOSE_TIME
+
+
+def session_started(moment: dt.datetime | None = None) -> bool:
+    """Had that day's session already opened when this collection was taken?
+
+    THE ONE DEFINITION OF A TRADING DAY'S SNAPSHOT. Every daily figure — OI
+    Delta, the Unusual Activity baseline, the day rows behind Changes — picks
+    one collection per day and calls it that day, and they all ask this.
+
+    "A New York weekday" was not enough, measured on collected data. With the
+    market closed the worker takes one snapshot per day, and the first cycle
+    after midnight is 00:1x New York: until the open that snapshot is "today",
+    so OI Delta compares last night's chain with yesterday afternoon's — open
+    interest is not refreshed overnight, so every row reads zero — and a
+    holiday's single snapshot (SPY on Labor Day, 00:26) became a trading day
+    of its own, compared against the day before as if something had happened.
+
+    AT OR AFTER THE OPEN, not "within the session": a collection taken after
+    the close is the day's best representative, which is why the readers take
+    the LAST collection of each day. Holidays and half-days come from the
+    exchange calendar exactly as `state_from_clock` takes them; without it this
+    degrades to weekdays from 09:30.
+    """
+    local = to_market_time(moment)
+    opens, _closes = session_times(local.date())
+    return opens is not None and local.time() >= opens
 
 
 def state_from_clock(moment: dt.datetime | None = None) -> str:

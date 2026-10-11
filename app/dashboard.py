@@ -1275,8 +1275,11 @@ if active_view == "Changes":
             with st.expander("ℹ️ How to read this"):
                 st.write(
                     "Two trading days of your own collection, side by side. A day is New "
-                    "York's date, and the row describes that day's last collection — the "
-                    "same rule OI Delta uses, so the two views never disagree about what "
+                    "York's date, and the row describes that day's last collection. It "
+                    "counts only once that day's session has opened: weekends, exchange "
+                    "holidays and the snapshot taken overnight before the bell are not "
+                    "days of their own, so on a Monday the day before is Friday. The same "
+                    "rule OI Delta uses, so the two views never disagree about what "
                     "\"yesterday\" means.\n\n"
                     "Colour is reserved for the regime: green when the day moved towards "
                     "dealer hedging damping moves, purple when it moved towards amplifying "
@@ -1966,13 +1969,13 @@ if active_view == "Unusual Activity":
             "a large trade can be part of a hedge for an entirely different position.\n\n"
             "The data source's volume is cumulative since the start of the trading session, "
             "so the history for the mean/standard deviation is built from one (the latest) "
-            "snapshot per calendar day — multiple same-day collections are never mixed "
+            "snapshot per trading day — multiple same-day collections are never mixed "
             "together when computing the statistics."
         )
 
 if active_view == "OI Delta":
     st.subheader("Open Interest change (latest day vs. previous)")
-    # Two calendar days is the entire input to a day-over-day difference, and
+    # Two trading days is the entire input to a day-over-day difference, and
     # the days are named by the run log before any snapshot row is read.
     delta = metrics.oi_delta(
         db.get_snapshots_at(
@@ -1984,7 +1987,7 @@ if active_view == "OI Delta":
         )
     )
     if delta.empty:
-        st.info("Data from at least two distinct calendar days is needed to compute the OI change.")
+        st.info("Data from at least two distinct trading days is needed to compute the OI change.")
     else:
         st.dataframe(delta, use_container_width=True)
         with st.expander("ℹ️ How to read this"):
@@ -1992,7 +1995,7 @@ if active_view == "OI Delta":
                 "`open_interest` — the current value as of the latest day, for scale: a "
                 "1000-contract increase is a lot at OI=2000 and barely noticeable at "
                 "OI=200000. `oi_delta` — the absolute signed change: positive — new "
-                "positions opened at this strike over the last calendar day (OI grew), "
+                "positions opened at this strike since the previous trading day (OI grew), "
                 "negative — some positions closed. `oi_delta_pct` — the same change as a "
                 "percentage of the previous value (empty if the previous OI was 0 — growth "
                 "\"from zero\" has no percentage form). Rows are sorted by the magnitude of "
@@ -2001,7 +2004,9 @@ if active_view == "OI Delta":
                 "of sign) that most often form new dealer hedging-flow levels (see the Max "
                 "Pain/GEX tab).\n\n"
                 "The data source's open interest barely updates intraday, so the comparison "
-                "is between the latest snapshots of two distinct calendar days rather than "
+                "is between the latest snapshots of two distinct trading days rather than "
                 "the two most recent collections — if you collected data several times "
-                "today, only the freshest collection of the day is used for the comparison."
+                "today, only the freshest collection of the day is used for the comparison. "
+                "A day counts once its session has opened: before the bell, and on weekends "
+                "and holidays, the comparison is between the last two sessions."
             )

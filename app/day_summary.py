@@ -2,6 +2,8 @@
 
     docker compose run --rm --no-deps worker \\
         python -m app.day_summary --backfill [--days 45] [--dry-run]
+    docker compose run --rm --no-deps worker \\
+        python -m app.day_summary --drop-non-session-days [--dry-run]
 
 WHY A ROW PER DAY EXISTS AT ALL. What this tool has that a web page of today's
 numbers does not is the history it collected on your own machine — and it used
@@ -11,12 +13,15 @@ daily summary is made of — the walls, the flip, the regime, net GEX over the
 near term — existed only for the newest moment, so "what changed since
 yesterday" could not be answered from anything stored. Now it can.
 
-WHAT "A DAY" IS. New York's calendar date of the collection, weekdays only —
-exactly the rule the OI Delta and the Unusual Activity baseline already apply.
-A collection at 04:04 UTC on a Tuesday is 00:04 in New York and files under
-Tuesday; by the close the row has been overwritten by Tuesday's own session,
-which is what the UPSERT is for. Two views with two different "yesterday"s
-would be one screen contradicting another, so no second rule is invented here.
+WHAT "A DAY" IS. A session that has opened: New York's calendar date of the
+collection, counted only once that day's session had started by the time it was
+taken (`market_calendar.session_started`). The same rule OI Delta and the
+Unusual Activity baseline apply, because two views with two different
+"yesterday"s would be one screen contradicting another. The worker still takes
+one snapshot on a closed day — a weekend, a holiday, the hours after midnight —
+and that snapshot makes no row: it holds the previous session's chain, and a
+row for it would put two copies of one state in the pickers and report the
+provider's overnight re-pricing as a day's change.
 
 WHAT IS IN THE ROW AND WHAT IS NOT. The summary's figures, the nearest
 meaningful expiry's max pain and expected move, the chain's shape and the GEX
@@ -91,12 +96,17 @@ def session_day(moment) -> dt.date:
     return market_calendar.market_day(stamp)
 
 
-def is_session_day(day: dt.date) -> bool:
-    """Weekdays only, as the per-day moment list already filters. The
-    exchange calendar's holidays are deliberately NOT consulted here, so that
-    the two rules cannot drift apart; a holiday's single closed-market snapshot
-    makes a row that says the same as the day before, which is honest."""
-    return day.isoweekday() <= 5
+def is_session_snapshot(moment) -> bool:
+    """Whether a collection belongs to a session that had opened — the rule
+    every reader of a day applies, owned by `market_calendar.session_started`.
+
+    It used to be `is_session_day`, "weekdays only", and nothing called it:
+    the worker wrote a row for any day it collected on, so a weekend's single
+    snapshot became a Saturday row and Changes compared Saturday with Sunday.
+    Holidays were left out on purpose, on the argument that the row would only
+    repeat the day before — but repeating the day before is exactly what makes
+    it a false entry in a view about what changed."""
+    return market_calendar.session_started(pd.Timestamp(moment).to_pydatetime())
 
 
 # --- the row --------------------------------------------------------------
@@ -119,6 +129,9 @@ def summarize(
     if reading is None or chain.empty:
         return None
     moment = pd.Timestamp(reading["collected_at"])
+    # A collection outside a session makes no row; see the module docstring.
+    if not is_session_snapshot(moment):
+        return None
     snapshot = chain[chain["collected_at"] == moment]
     if snapshot.empty:
         return None
@@ -515,6 +528,10 @@ def build_row(conn, ticker: str, source: str, moment, pricing) -> dict | None:
     weather, summarize — the collection pass's own path, replayed."""
     from app import db  # local import: db imports config, not this module
 
+    # Before the read and the solve, which are the whole cost: `summarize`
+    # would refuse the row anyway.
+    if not is_session_snapshot(moment):
+        return None
     raw = db.get_snapshots_at(conn, ticker, [moment], source=source)
     if raw.empty:
         return None
@@ -582,14 +599,27 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — a comman
     parser.add_argument("--backfill", action="store_true", help="Build the rows missing from the last --days days.")
     parser.add_argument("--days", type=int, default=config.DAY_SUMMARY_BACKFILL_DAYS)
     parser.add_argument("--ticker", help="Only this ticker (default: every watched ticker).")
-    parser.add_argument("--dry-run", action="store_true", help="Count what would be built; write nothing.")
+    parser.add_argument(
+        "--drop-non-session-days", action="store_true",
+        help="Delete rows an older version wrote for weekends, holidays and pre-open snapshots.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Count what would change; write nothing.")
     args = parser.parse_args(argv)
-    if not args.backfill:
+    if args.backfill == args.drop_non_session_days:
         parser.print_help()
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     conn = db.get_connection()
     try:
+        if args.drop_non_session_days:
+            dropped = db.drop_non_session_day_summaries(
+                conn, [args.ticker] if args.ticker else None, dry_run=args.dry_run
+            )
+            log.info(
+                "%s %d day row(s) of days with no session.",
+                "Would delete" if args.dry_run else "Deleted", dropped,
+            )
+            return 0
         tickers = [args.ticker.upper()] if args.ticker else db.get_watchlist(conn)
         count = 0
         for ticker in tickers:
