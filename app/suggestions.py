@@ -301,15 +301,21 @@ def source_refusal(ticker: str, substitute: str | None, provider: str = "the cur
             f"{provider} serves those contracts inside the {substitute} chain. Add "
             f"**{substitute}** to collect them."
         )
-    head = (
-        f"“{candidate}” is a real symbol with listed options, but {provider} "
-        "does not serve its option chain, so there would be nothing to collect."
-    )
     if substitute:
+        head = (
+            f"“{candidate}” is a real symbol with listed options, but {provider} "
+            "does not serve its option chain, so there would be nothing to collect."
+        )
         return f"{head} **{substitute}** tracks the same underlying and {_CARRY_OVER}"
+    # VIX, the one symbol refused with nothing to offer. Not "the source has no
+    # chain": Yahoo lists one, and saying otherwise is the kind of claim the
+    # person who trades it knows to be false.
     return (
-        f"{head} There is no honest substitute: an ETF on VIX futures is a "
-        "different instrument with its own term structure, not a proxy for the index."
+        f"“{candidate}” is a real symbol with listed options, but they are priced off "
+        f"VIX futures, which {provider} does not serve — every greek computed here would "
+        "be wrong, so it is not collected. There is no honest substitute: an ETF on VIX "
+        "futures is a different instrument with its own term structure, not a proxy for "
+        "the index."
     )
 
 
