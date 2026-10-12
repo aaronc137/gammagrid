@@ -841,13 +841,87 @@ def check_disk_estimate_respects_the_market_calendar():
     # 21 trading days plus one snapshot on each of the nine closed ones.
     assert actual_15 == 21 * (390 / 15) + 9, actual_15
 
-    # A four-hour interval gets a fraction of a pass per session, and rounding
-    # it up would bring back a smaller version of the same overstatement.
-    assert database._passes_per_month(240) < 21 * 2 + 9
+    # A session starts with a pass at the bell and has one per interval while
+    # it is open, so the count is whole: 09:30 … 15:30 is seven at an hourly
+    # interval, 09:30 and 13:30 are two at four hours. It used to be 6.5 and
+    # 1.625, as if the first pass of a day could land anywhere.
+    assert database._passes_per_month(60) == 21 * 7 + 9
+    assert database._passes_per_month(240) == 21 * 2 + 9
 
     # Never below one pass per trading day, however long the interval.
     assert database._passes_per_month(100_000) == 21 + 9
     print("disk-estimate checks passed")
+
+
+def check_disk_estimate_counts_every_ticker_in_a_pass():
+    """The growth figure must price a whole pass, not one ticker's chain.
+
+    THE DEFECT. Each ticker in a pass is stored under its own `collected_at`,
+    and the estimate divided every stored row by every distinct moment — rows
+    per TICKER per pass, an average chain. On a five-ticker watchlist with SPX
+    in it the caption said 0.1 GB a month for what costs about 1.5. On the
+    data below the old formula answers 164 rows per pass — the average stored
+    chain, a ticker nobody watches any more included; a pass writes 50.
+
+    Own data on an empty database: two tickers collected three times, one
+    watched but never collected, one collected but no longer watched, and runs
+    that must not count — refused ones, and chains older than the ten most
+    recent collections the size is averaged over.
+    """
+    from app import config
+    from app import db as database
+
+    conn = db.get_connection()
+    testdb.truncate_all(conn)
+    for ticker in ("DISKA", "DISKB", "DISKC"):
+        db.add_ticker(conn, ticker)
+    live = (dt.date.today() + dt.timedelta(days=90)).isoformat()
+
+    def chain(rows: int) -> pd.DataFrame:
+        return pd.DataFrame([
+            _chain_row(live, 100.0 + i // 2, "call" if i % 2 == 0 else "put") for i in range(rows)
+        ])
+
+    def collect(ticker: str, moment: datetime, rows: int, store: bool = True) -> None:
+        if store:
+            db.insert_snapshot(conn, ticker, moment, 100.0, chain(rows))
+        db.log_run(conn, moment, moment + dt.timedelta(seconds=5), ticker, "success", rows_fetched=rows)
+
+    first = datetime(2026, 9, 1, 14, 0)
+    # Two old, larger chains of DISKA's, then ten of 40 rows: only the ten count.
+    for k in range(12):
+        moment = first + dt.timedelta(hours=k)
+        collect("DISKA", moment, 400 if k < 2 else 40, store=k >= 9)
+    # Each ticker of a pass gets its own moment, as the collector stores them.
+    for k in range(9, 12):
+        collect("DISKB", first + dt.timedelta(hours=k, seconds=20), 10)
+    # A refused chain is logged with its size and stores nothing.
+    db.log_run(conn, first + dt.timedelta(hours=12), first + dt.timedelta(hours=12, seconds=5),
+               "DISKB", "failed", rows_fetched=5000)
+    # Collected once and then removed from the watchlist: not part of a pass.
+    collect("DISKGONE", first, 1000)
+
+    by_ticker = database.rows_per_pass_by_ticker(conn)
+    assert by_ticker == {"DISKA": 40.0, "DISKB": 10.0, "DISKC": None}, by_ticker
+
+    passes = database._passes_per_month(60)
+    expected = 50 * passes * config.BYTES_PER_SNAPSHOT_ROW / 1_000_000
+    got = database.estimated_growth_mb_per_month(conn, 60)
+    assert abs(got - expected) < 1e-9, (
+        f"{got:.3f} MB a month, not {expected:.3f}: one hourly pass writes 40 + 10 rows "
+        f"for the two watched tickers collected so far"
+    )
+    assert database.estimated_growth_mb_per_month(conn, 60, by_ticker) == got
+    assert database.estimated_growth_mb_per_month(conn, 0) == 0.0
+
+    # Nothing collected at all is zero, which the caption reads as "collect first".
+    testdb.truncate_all(conn)
+    db.add_ticker(conn, "DISKC")
+    assert database.rows_per_pass_by_ticker(conn) == {"DISKC": None}
+    assert database.estimated_growth_mb_per_month(conn, 60) == 0.0
+    testdb.truncate_all(conn)
+    conn.close()
+    print(f"disk estimate counts the whole pass (50 rows, {got:.2f} MB a month hourly)")
 
 
 def check_version_comes_from_the_changelog():
@@ -2598,6 +2672,8 @@ def main():
     testdb.truncate_all(reset)
     reset.close()
 
+    # First, and empty again when it returns: it owns the whole watchlist.
+    check_disk_estimate_counts_every_ticker_in_a_pass()
     check_timezone_database_is_available()
     check_years_to_expiry()
     check_greeks_respond_to_time()

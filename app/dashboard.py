@@ -725,12 +725,20 @@ with st.sidebar:
     # watchlist rather than from a generic figure — chain sizes differ by an
     # order of magnitude between one small ticker and a few index ETFs.
     if chosen_minutes > 0:
-        growth = db.estimated_growth_mb_per_month(conn, chosen_minutes)
+        rows_by_ticker = db.rows_per_pass_by_ticker(conn)
+        growth = db.estimated_growth_mb_per_month(conn, chosen_minutes, rows_by_ticker)
+        not_counted = [ticker for ticker, rows in rows_by_ticker.items() if rows is None]
         if growth > 0:
             st.caption(
                 f"About {growth / 1000:.1f} GB per month at this interval, for your current "
                 f"watchlist. Nothing is ever deleted; expired contracts move to a separate "
                 f"table after {config.CONTRACT_ARCHIVE_GRACE_DAYS} days."
+                + (
+                    f" Not counted yet: {', '.join(not_counted)} — "
+                    f"{'it has' if len(not_counted) == 1 else 'they have'} not been "
+                    "collected, so there is no chain size to measure."
+                    if not_counted else ""
+                )
             )
         else:
             st.caption(

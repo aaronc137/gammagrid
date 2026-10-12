@@ -4,6 +4,7 @@ a connection directly."""
 from __future__ import annotations
 
 import datetime as dt
+import math
 import warnings
 from datetime import datetime
 
@@ -871,15 +872,62 @@ def set_collector_interval(conn: psycopg.Connection, minutes: int) -> None:
     set_setting(conn, COLLECTOR_INTERVAL_KEY, str(int(minutes)))
 
 
-def estimated_growth_mb_per_month(conn: psycopg.Connection, interval_minutes: int) -> float:
+# How many of a ticker's latest successful collections its chain size is
+# averaged over. Recent rather than all of them: a chain grows and shrinks as
+# expiries are listed and roll off, and the estimate is about the month ahead.
+_RUNS_PER_ESTIMATE = 10
+
+
+def rows_per_pass_by_ticker(conn: psycopg.Connection) -> dict[str, float | None]:
+    """How many snapshot rows one collection pass writes, per watched ticker.
+
+    PER TICKER, BECAUSE A PASS IS ONE COLLECTION PER TICKER. Every ticker in a
+    pass is stored under its own `collected_at`, so the rows of one moment are
+    one ticker's chain, never the whole watchlist's. The estimate used to divide
+    all rows by all moments and so priced one average chain per pass — on a
+    five-ticker watchlist it said 0.1 GB a month for what costs 1.5.
+
+    Read from the collection log rather than from the snapshots: `rows_fetched`
+    is what each successful run stored, the log is small and indexed by
+    ticker, and it still has the count after the archive has moved a past
+    chain's expired contracts out of the hot table. A ticker with no successful
+    run yet maps to None — nothing to measure, and the caller says so rather
+    than counting it as free. Tickers no longer watched are not asked about.
+    """
+    rows = conn.execute(
+        """SELECT w.ticker, avg(r.rows_fetched)::float
+             FROM watchlist w
+             LEFT JOIN LATERAL (
+                   SELECT rows_fetched
+                     FROM collection_runs
+                    WHERE ticker = w.ticker AND status = 'success'
+                      AND COALESCE(rows_fetched, 0) > 0
+                    ORDER BY started_at DESC
+                    LIMIT %s
+             ) r ON true
+            GROUP BY w.ticker
+            ORDER BY w.ticker""",
+        (_RUNS_PER_ESTIMATE,),
+    ).fetchall()
+    return {ticker: (float(avg) if avg is not None else None) for ticker, avg in rows}
+
+
+def estimated_growth_mb_per_month(
+    conn: psycopg.Connection,
+    interval_minutes: int,
+    rows_by_ticker: dict[str, float | None] | None = None,
+) -> float:
     """What continuous collection will cost on disk, for THIS watchlist.
 
-    Answered from the rows already collected rather than from a guess: the
-    average chain size differs by an order of magnitude between a single small
-    ticker and a handful of index ETFs, so a generic number would be wrong in
-    the only direction that matters. With nothing collected yet there is
-    nothing to measure and the answer is zero — the interface says so rather
-    than inventing a figure.
+    Answered from the chains already collected rather than from a guess: chain
+    size differs by two orders of magnitude between a small single stock and an
+    index (MO stores about 500 rows a collection, SPX about 17,800), so a
+    generic number would be wrong in the only direction that matters. One pass
+    writes every watched ticker's chain, so the rows per pass are the sum of
+    `rows_per_pass_by_ticker` — tickers not collected yet contribute nothing,
+    and with nothing collected at all the answer is zero, which the interface
+    says rather than inventing a figure. `rows_by_ticker` is that mapping when
+    the caller already has it (to name the tickers left out).
 
     This exists to be shown at the moment somebody switches collection on. A
     background process filling a stranger's disk without ever having named a
@@ -887,11 +935,9 @@ def estimated_growth_mb_per_month(conn: psycopg.Connection, interval_minutes: in
     """
     if interval_minutes <= 0:
         return 0.0
-    row = conn.execute(
-        """SELECT count(*)::float / GREATEST(count(DISTINCT collected_at), 1)
-           FROM option_snapshots"""
-    ).fetchone()
-    rows_per_pass = float(row[0] or 0)
+    if rows_by_ticker is None:
+        rows_by_ticker = rows_per_pass_by_ticker(conn)
+    rows_per_pass = sum(rows for rows in rows_by_ticker.values() if rows is not None)
     return (
         rows_per_pass
         * _passes_per_month(interval_minutes)
@@ -925,10 +971,21 @@ def _passes_per_month(interval_minutes: int) -> float:
     somebody decides whether to switch collection on at all, and a fivefold
     exaggeration can make that decision for them.
 
-    Fractional passes per session are deliberate and not rounded up. At a
-    4-hour interval a 6.5-hour session gets 1.625 collections — some days two,
-    some days one — and rounding that to two would reintroduce a smaller
-    version of the same overstatement.
+    A SESSION GETS A WHOLE NUMBER OF PASSES, the first at the bell. This used
+    to count 390 / interval of them — 6.5 an hour, 1.625 at four hours — on
+    the reasoning that some days get two and some one. None do: the worker
+    never sleeps past the open (`worker.sleep_seconds`), so every session
+    starts with a pass at 09:30 and then one per interval while the market is
+    open — 09:30, 10:30 … 15:30 is seven at an hourly interval, and 09:30 and
+    13:30 are two at four hours, every day. The local install's own log shows
+    it: a session collected hourly from the open starts at 09:30 and 10:30.
+
+    The closed days keep their one snapshot each. A trading day's own
+    closed-market snapshot, taken overnight before the open, is not counted:
+    at that hour the source serves most chains with open interest zeroed, the
+    quality check refuses them, and nothing is stored — on 13 of the 16 such
+    nights in the local install's log. Counting it would add an eighth to the
+    figure at hourly to cover the odd night it succeeds.
 
     The session length is read from market_calendar rather than written down
     again: it is the module that decides when the collector actually runs, so
@@ -938,7 +995,7 @@ def _passes_per_month(interval_minutes: int) -> float:
         dt.datetime.combine(dt.date.min, market_calendar.CLOSE_TIME)
         - dt.datetime.combine(dt.date.min, market_calendar.OPEN_TIME)
     ).total_seconds() / 60
-    passes_per_session = max(open_minutes / interval_minutes, 1.0)
+    passes_per_session = max(math.ceil(open_minutes / interval_minutes), 1)
     return _TRADING_DAYS_PER_MONTH * passes_per_session + _CLOSED_DAYS_PER_MONTH
 
 

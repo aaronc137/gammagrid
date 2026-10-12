@@ -273,17 +273,19 @@ under frequent requests, and the floor is enforced in code, not just in the
 list.
 
 Collecting continuously fills a disk, so here is the arithmetic rather than a
-shrug. One stored row costs about 214 bytes, and one pass stores one row per
-contract in every watchlist ticker's chain — a few hundred for a small single
-name, ~14,000 for SPY. The collector runs during the 6.5-hour session on the
-21 trading days in a month, plus one snapshot on each closed day:
+shrug. One stored row costs about 285 bytes with its indexes, and one pass
+stores one row per contract in every watchlist ticker's chain — a few hundred
+for a small single name, ~9,000 for SPY, ~18,000 for SPX. The collector runs
+during the 6.5-hour session on the 21 trading days in a month, starting at the
+opening bell and then once per interval (seven passes a session at hourly),
+plus one snapshot on each closed day:
 
 | Interval | Small watchlist (~1,000 contracts) | With an index ETF (~15,000) |
 |---|---|---|
-| Once a day | ~6 MB/month | ~96 MB/month |
-| Every 4 hours | ~9 MB/month | ~138 MB/month |
-| Hourly | ~31 MB/month | ~467 MB/month |
-| Every 15 minutes | ~119 MB/month | ~1.8 GB/month |
+| Once a day | ~9 MB/month | ~128 MB/month |
+| Every 4 hours | ~15 MB/month | ~218 MB/month |
+| Hourly | ~44 MB/month | ~667 MB/month |
+| Every 15 minutes | ~158 MB/month | ~2.4 GB/month |
 
 **These numbers used to be about five times larger,** because they assumed
 collection ran around the clock — which stopped being true in v0.5.0, when the
@@ -293,7 +295,9 @@ so nothing changes.
 
 The sidebar shows this figure for **your** watchlist at the moment you choose an
 interval, computed from what you have already collected rather than from the
-table above.
+table above: each watched ticker's chain, averaged over its last ten
+collections, added up over the watchlist. A ticker not collected yet is named
+as not counted.
 
 **Nothing is ever deleted.** Contracts that expired more than 30 days ago move
 to a separate table so the one every chart reads stays small; their history
