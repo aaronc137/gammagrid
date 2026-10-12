@@ -2118,6 +2118,36 @@ def _day_chain(moment: dt.datetime, spot: float, expiry: dt.date, oi_scale: floa
     return pd.DataFrame(rows)
 
 
+def check_every_weather_state_has_its_picture():
+    """Each of the five states draws its own glyph on the hosted product's
+    48-unit grid, with the colours saying what the state says: a green sun
+    wherever hedging still damps, a purple bolt or rain wherever it amplifies,
+    and both at once only where the price sits on the flip."""
+    from app import theme, weather
+
+    states = (metrics.WEATHER_CLEAR, metrics.WEATHER_FAIR, metrics.WEATHER_UNSETTLED,
+              metrics.WEATHER_RAIN, metrics.WEATHER_STORM)
+    pictures = set()
+    for state in states:
+        reading = {
+            "state": state, "net_gex": 1.0, "gamma_flip": 100.0, "underlying_price": 101.0,
+            "flip_distance_pct": 1.0, "collected_at": "2026-09-09 19:42",
+        }
+        html = weather.panel(reading)
+        assert '<svg width="48" height="48" viewBox="0 0 48 48"' in html, state
+        art = weather._ART[state]
+        pictures.add(art)
+        sunny = state in (metrics.WEATHER_CLEAR, metrics.WEATHER_FAIR, metrics.WEATHER_UNSETTLED)
+        wet = state in (metrics.WEATHER_UNSETTLED, metrics.WEATHER_RAIN, metrics.WEATHER_STORM)
+        assert (theme.ACCENT in art) == sunny, state
+        assert (theme.PRIMARY in art) == wet, state
+        # A sun is a disc with rays, not a dot: the rays are what Unsettled lost.
+        assert not sunny or art.count("<line") >= 3, state
+    assert len(pictures) == len(states)
+
+    print("weather glyph checks passed (five states, five pictures, colours by regime)")
+
+
 def check_the_day_row_and_the_ladder():
     """A day row from a chain, and what two of them say happened.
 
@@ -2497,6 +2527,7 @@ def main():
     check_the_run_log_answers_how_collection_is_going()
     check_a_closed_market_is_not_a_failure()
     check_realized_volatility_is_stored_once_a_day_and_read_back()
+    check_every_weather_state_has_its_picture()
     check_the_day_row_and_the_ladder()
     check_a_day_is_a_session_that_opened()
     check_day_summaries_are_written_and_filled_in()

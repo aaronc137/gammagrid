@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   differently depending on the day its image was built.
 
 ### Fixed
+- **The gamma-weather glyphs are the hosted version's again.** Unsettled was
+  drawn as a green dot beside a cloud and a bolt, where the hosted product
+  draws a sun with rays behind the cloud — both regimes visibly in play — and
+  Fair had lost one of its rays. All five states now use the same art, on the
+  same grid, as the hosted product's summary strip and share card.
 - **Changes, OI Delta and the Unusual Activity baseline no longer count a day
   the market did not trade.** With the market closed the collector takes one
   snapshot a day as a safety net — on weekends, on exchange holidays, and just
