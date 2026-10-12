@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   down in the README: on the third Friday of the month Yahoo serves one
   contract per strike, the monthly AM-settled SPX where it is listed, so that
   day's SPXW chain is incomplete.
+- **Every view's "How to read this" links its lesson in the Guide.** The
+  right end of the block's label reads "Guide · lesson N →" and opens the
+  lesson of the public Guide at gammagrid.io that explains that view — the
+  put/call ratio for Overview, the GEX heatmap for GEX Heatmap, and so on,
+  the same lesson the hosted version links. The sidebar links the Guide's
+  contents page. They are plain links: no tracking parameters, nothing
+  counted, nothing sent anywhere until you follow one.
 
 ### Changed
 - **The interface now reads the same as the hosted version.** Same palette,
