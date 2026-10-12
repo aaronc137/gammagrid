@@ -74,6 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   draws a sun with rays behind the cloud — both regimes visibly in play — and
   Fair had lost one of its rays. All five states now use the same art, on the
   same grid, as the hosted product's summary strip and share card.
+- **Changes no longer reads like graph paper.** Its table had a box drawn
+  around every cell, on top of the page's background grid, so every number
+  sat in a cage of lines from two sources. The table now has rules between
+  rows only, and the background grid is drawn at the strength the hosted
+  version uses — the grid colour mixed with the page background — which
+  quiets it under every view, not just this one.
 - **Changes, OI Delta and the Unusual Activity baseline no longer count a day
   the market did not trade.** With the market closed the collector takes one
   snapshot a day as a safety net — on weekends, on exchange holidays, and just

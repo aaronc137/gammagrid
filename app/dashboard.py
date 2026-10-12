@@ -446,13 +446,19 @@ conn = db.get_connection()
 # default Streamlit. Deliberately NOT touching st.dataframe/st.data_editor
 # styling: dense tables need to stay plain and readable, not branded —
 # over-styling them would visually overload the page.
+#
+# THE GRID IS MUTED UNDER THE APP, as the hosted product mutes it: its lines
+# are the grid colour mixed 55/45 with the page background. At full strength
+# it is the right weight for a landing page with nothing on it and too heavy
+# under a screen of text — a ladder like Changes, set in plain ink on the bare
+# background, read as if printed on graph paper.
 st.markdown(
     """
     <style>
       .stApp {
         background-image:
-          linear-gradient(#1C2320 1px, transparent 1px),
-          linear-gradient(90deg, #1C2320 1px, transparent 1px);
+          linear-gradient(color-mix(in srgb, #1C2320 55%, #0A0C0B) 1px, transparent 1px),
+          linear-gradient(90deg, color-mix(in srgb, #1C2320 55%, #0A0C0B) 1px, transparent 1px);
         background-size: 64px 64px;
         background-position: center -1px;
       }
