@@ -97,6 +97,32 @@ def stylesheet() -> str:
     font-variant-numeric: tabular-nums;
   }}
 
+  /* A view's lesson in the Guide (app/guide.py), on the right end of its
+     "How to read this" label, where the hosted product puts it, and quiet
+     until pointed at like every other link in the chrome. It is its own
+     element placed just above the block: it takes no height and gives back
+     the gap the page would put after it, then sits down onto the label. */
+  [data-testid="stElementContainer"]:has(.gg-guide-link) {{
+    position: relative;
+    margin-bottom: -1rem;
+    z-index: 1;
+  }}
+  .gg-guide-link {{
+    position: absolute;
+    /* The middle of the label row below, which is about 2.5rem tall. */
+    top: 1.25rem;
+    right: 12px;
+    transform: translateY(-50%);
+    line-height: 20px;
+  }}
+  .gg-guide-link a {{
+    font-size: {TEXT_BASE};
+    color: {MUTED};
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  .gg-guide-link a:hover, .gg-guide-link a:focus-visible {{ color: {ACCENT_SOFT}; }}
+
   /* The summary panel above the views. */
   .gg-weather {{
     display: flex;

@@ -21,6 +21,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     day_summary,
     db,
     freshness,
+    guide,
     market_calendar,
     metrics,
     providers,
@@ -108,6 +109,13 @@ def _cached_collection_depth() -> dict[str, dt.date]:
 
 
 
+def howto(view: str, title: str = "ℹ️ How to read this", expanded: bool = False):
+    """A view's first explanation block, with its lesson in the Guide on the
+    right of the label (app/guide.py). Used as `with howto("Overview"):`."""
+    st.markdown(guide.link(view), unsafe_allow_html=True)
+    return st.expander(title, expanded=expanded)
+
+
 def render_option_detail(
     conn, df: pd.DataFrame, selected_ticker: str, tracked: pd.DataFrame,
     opt_expiry: pd.Timestamp, opt_strike: float, opt_type: str, key_prefix: str,
@@ -141,7 +149,7 @@ def render_option_detail(
     with price_column:
         st.subheader("Option price")
         st.line_chart(with_viewer_index(greeks_history)["last_price"], color=BRAND_PURPLE)
-    with st.expander("ℹ️ How to read this"):
+    with howto("Contract"):
         st.write(
             "Price history of this specific contract (last price at each collection). "
             "Compare the option's price action with the underlying's move and with the IV "
@@ -807,6 +815,10 @@ with st.sidebar:
         use_container_width=True,
         help="Stars are how people find this project — there is no marketing budget behind it.",
     )
+    # The Guide's contents page, for somebody who wants the whole subject
+    # rather than one chart of it. A plain link, like the lessons each view
+    # links to (app/guide.py says why plain).
+    st.caption(f"[Guide: options positioning from zero →]({guide.url()})")
     st.caption("Questions or feedback: [hello@gammagrid.io](mailto:hello@gammagrid.io)")
     # The revision, in the footer of the sidebar rather than in the header.
     # Every self-hosted installation is a different version — people update
@@ -1022,7 +1034,7 @@ if active_view == "Overview":
     # definition of the ratio and the oracle the tests check this against.
     pcr = db.get_put_call_ratio(conn, selected_ticker, days=history_days, source=page_source)
     st.line_chart(with_viewer_index(pcr)[["pcr_volume", "pcr_oi"]], color=[BRAND_PURPLE, BRAND_GREEN])
-    with st.expander("ℹ️ How to read this"):
+    with howto("Overview"):
         st.write(
             "The ratio of put to call volume/open interest. A value noticeably above "
             "0.7–1.0 usually signals a defensive/bearish stance, below — a bullish one. "
@@ -1278,7 +1290,7 @@ if active_view == "Changes":
                     color=[BRAND_GREEN, BRAND_PURPLE][: len(frame.columns)],
                 )
 
-            with st.expander("ℹ️ How to read this"):
+            with howto("Changes"):
                 st.write(
                     "Two trading days of your own collection, side by side. A day is New "
                     "York's date, and the row describes that day's last collection. It "
@@ -1327,7 +1339,7 @@ if active_view == "Max Pain / GEX":
     st.subheader("Max Pain")
     mp = metrics.max_pain(latest_df, selected_expiry)
     st.metric("Max Pain strike", mp if mp is not None else "n/a")
-    with st.expander("ℹ️ How to read this"):
+    with howto("Max Pain / GEX"):
         st.write(
             "The strike at which total payouts by option sellers are minimal. The price at "
             "expiration statistically gravitates toward this level, since market makers "
@@ -1562,7 +1574,7 @@ if active_view == "GEX Heatmap":
                 row_height=row_height,
             )
 
-        with st.expander("ℹ️ How to read this"):
+        with howto("GEX Heatmap"):
             st.write(
                 "Each cell is the approximate GEX (Black-Scholes, same sign heuristic as on the "
                 "Max Pain/GEX tab) for a specific strike and expiry, computed on a single "
@@ -1627,7 +1639,7 @@ if active_view == "Volatility (IV)":
             "contract's price. They are being recomputed in the background while the "
             "collector runs — nothing to start, and the rest of this page is unaffected."
         )
-    with st.expander("ℹ️ How to read this"):
+    with howto("Volatility (IV)"):
         st.write(
             "Rising average IV usually precedes an anticipated move (earnings, news) or "
             "already reflects increased market uncertainty. Falling — the market is calming "
@@ -1832,7 +1844,7 @@ if active_view == "Screener":
         # precisely — exact numeric input removes that problem outright. Min/max
         # come from the actual data (full range = nothing filtered by default).
         INT_FILTER_COLUMNS = {"dte", "open_interest"}
-        with st.expander("🔍 Filters (ranges)", expanded=True):
+        with howto("Screener", "🔍 Filters (ranges)", expanded=True):
             filter_cols = st.columns(3)
             mask = pd.Series(True, index=screener.index)
             for i, (col_name, label) in enumerate(FILTER_SPECS):
@@ -1963,7 +1975,7 @@ if active_view == "Unusual Activity":
     )
     st.caption(f"Contracts found: {len(flagged)}")
     st.dataframe(flagged, use_container_width=True)
-    with st.expander("ℹ️ How to read this"):
+    with howto("Unusual Activity"):
         st.write(
             "A contract is flagged when today's volume statistically significantly exceeds "
             f"(z-score above {config.UNUSUAL_Z_THRESHOLD}) this specific contract's own "
@@ -1996,7 +2008,7 @@ if active_view == "OI Delta":
         st.info("Data from at least two distinct trading days is needed to compute the OI change.")
     else:
         st.dataframe(delta, use_container_width=True)
-        with st.expander("ℹ️ How to read this"):
+        with howto("OI Delta"):
             st.write(
                 "`open_interest` — the current value as of the latest day, for scale: a "
                 "1000-contract increase is a lot at OI=2000 and barely noticeable at "
