@@ -69,6 +69,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   differently depending on the day its image was built.
 
 ### Fixed
+- **"About X GB per month" now prices a whole collection pass.** Every
+  ticker in a pass is stored under its own moment, and the estimate divided
+  all stored rows by all moments — the size of one average chain, not of a
+  pass over the watchlist — so it came out low by about the number of
+  tickers: 0.1 GB a month at hourly for five tickers including SPX, which
+  cost about 1.6. It now adds up each watched ticker's chain, averaged over
+  its last ten successful collections in the collection log; a ticker not
+  collected yet is named under the figure as not counted. Two inputs were
+  corrected on the way. A row costs 285 bytes with its indexes, measured on
+  this product's own tables (the figure was 214, taken from the hosted
+  product). And a session gets a whole number of passes, since the collector
+  always takes the first one at the opening bell: seven at hourly, not 6.5,
+  and two at four hours, not 1.6. On the install this was measured on, one
+  pass of the five tickers wrote 35,879 rows, 10.2 MB; the new figure is
+  1.7 GB a month at hourly, against 0.1 before.
 - **A curve that only grazes zero is no longer reported as the gamma flip,
   and neither is a crossing more than 25% from the price.** Far from the
   money the cumulative GEX profile can wander a few thousand dollars either

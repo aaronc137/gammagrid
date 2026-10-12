@@ -91,6 +91,15 @@ def check_scheduled_collection(conn):
         assert stored == minutes, f"{label} ({minutes}) came back as {stored}"
 
     assert db.estimated_growth_mb_per_month(conn, 0) == 0.0, "off costs nothing"
+    # The chain size comes from the collection log, and this fixture stored its
+    # chains without logging a successful run: log one, as the collector would,
+    # of the size of TEST's latest stored chain.
+    latest, rows = conn.execute(
+        """SELECT collected_at, count(*) FROM option_snapshots WHERE ticker = 'TEST'
+           GROUP BY collected_at ORDER BY collected_at DESC LIMIT 1"""
+    ).fetchone()
+    db.log_run(conn, latest, latest, "TEST", "success", rows_fetched=rows)
+    assert db.rows_per_pass_by_ticker(conn) == {"TEST": float(rows)}
     hourly = db.estimated_growth_mb_per_month(conn, 60)
     quarter_hourly = db.estimated_growth_mb_per_month(conn, 15)
     assert quarter_hourly > hourly > 0, (hourly, quarter_hourly)

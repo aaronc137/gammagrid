@@ -130,11 +130,15 @@ COLLECTOR_INTERVAL_DEFAULT_MINUTES = 0
 # the collector at something the source will refuse to serve.
 PROVIDER_MIN_INTERVAL_MINUTES = 15
 
-# Roughly what one stored snapshot row costs on disk, measured on the hosted
-# product across millions of rows. Used to tell the user, at the moment they
-# choose an interval, how fast their database will grow — see
-# db.estimated_growth_mb_per_month.
-BYTES_PER_SNAPSHOT_ROW = 214
+# Roughly what one stored snapshot row costs on disk, indexes included. Used to
+# tell the user, at the moment they choose an interval, how fast their database
+# will grow — see db.estimated_growth_mb_per_month. Measured on this product's
+# own schema (a local install, 12.10.2026): option_snapshots 317.1 MB for
+# 1,048,092 rows (303 bytes each, its indexes 129 of them) and the archive
+# 59.8 MB for 274,584 (218 bytes, fewer indexes) — 285 bytes a row over both,
+# which is what a row costs over its life as it moves from one to the other.
+# The figure this replaced, 214, was the hosted product's, on another schema.
+BYTES_PER_SNAPSHOT_ROW = 285
 
 # How far back the z-score's baseline reaches, in calendar days. A cap rather
 # than a preference: the statistics are built from one snapshot per day per
