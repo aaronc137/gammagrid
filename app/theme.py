@@ -216,9 +216,16 @@ def stylesheet() -> str:
   }}
   .gg-ladder td {{
     padding: 7px 12px 7px 0;
-    border-top: 1px solid {GRID};
     vertical-align: baseline;
   }}
+  /* Rules between the rows and nothing else, as the hosted ladder draws them.
+     Streamlit boxes every cell of a markdown table on all four sides, and over
+     the page's grid that turned the ladder into graph paper: the eye had to
+     sort the table's lines from the background's before reading a number.
+     `table.` outweighs Streamlit's own selector for the same cells. */
+  table.gg-ladder th, table.gg-ladder td {{ border: none; }}
+  table.gg-ladder th {{ border-bottom: 1px solid {BORDER}; }}
+  table.gg-ladder td {{ border-bottom: 1px solid color-mix(in srgb, {BORDER} 60%, transparent); }}
   .gg-ladder .gg-num {{
     font-family: {FONT_MONO};
     font-variant-numeric: tabular-nums;
