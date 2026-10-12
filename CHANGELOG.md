@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-12
+
 ### Added
 - **Index options: SPX, XSP, NDX, RUT and DJX now collect.** Add them under
   their own names. Since 0.6.0 they were refused with an ETF offered instead,
@@ -807,7 +809,9 @@ Initial public release — see the [Roadmap](ROADMAP.md) for what's next.
 - Docker / Docker Compose quick start; GammaGrid brand theme (`.streamlit/config.toml`)
 - AGPL-3.0 license
 
-[Unreleased]: https://github.com/gammagrid/gammagrid/compare/v0.6.1...main
+[Unreleased]: https://github.com/gammagrid/gammagrid/compare/v0.8.0...main
+[0.8.0]: https://github.com/gammagrid/gammagrid/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/gammagrid/gammagrid/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/gammagrid/gammagrid/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gammagrid/gammagrid/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/gammagrid/gammagrid/compare/v0.5.1...v0.5.2
