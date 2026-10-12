@@ -18,6 +18,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app import metrics, theme
+from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
 
 # Label and sentence per state. The label is what the eye lands on; the
 # sentence is what makes it mean something the first time it is read.
@@ -75,7 +76,11 @@ def describe(weather: dict, latest_moment=None) -> dict:
     phrased in terms of distance to the flip, and there is no honest way to say
     "far from" a boundary that does not exist — an index whose cumulative
     profile never changes sign below its lowest strike is the ordinary case,
-    not a corner one. The sign then speaks alone and says so.
+    not a corner one. The sign then speaks alone and says so. The sentence
+    names the reach rather than the strike range: the core also drops a
+    crossing that only grazes zero, and one further than
+    `GAMMA_FLIP_MAX_DISTANCE` from the price, so "no flip" means none within
+    that distance, not none anywhere in the chain.
 
     `from_earlier_moment` is for screens that draw this beside fresher figures:
     the weather is built from one snapshot, and when that snapshot is not the
@@ -89,8 +94,8 @@ def describe(weather: dict, latest_moment=None) -> dict:
         scope = f"next {int(weather['horizon_dte'])} days · {n} {'expiry' if n == 1 else 'expiries'}"
     if weather["gamma_flip"] is None:
         sentence = (
-            "This chain has no gamma flip inside its strike range, so only the sign of "
-            "gamma is known — "
+            f"This chain has no gamma flip within {GAMMA_FLIP_MAX_DISTANCE:.0%} of the price, so "
+            "only the sign of gamma is known — "
             + (
                 "positive, hedging damps moves."
                 if weather["net_gex"] >= 0

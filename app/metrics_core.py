@@ -1268,6 +1268,16 @@ def dealer_walls(
     return {"call_wall": wall("call"), "put_wall": wall("put")}
 
 
+# Smallest share of the cumulative profile's largest absolute value that a
+# value on each side of a zero crossing must exceed for the crossing to count
+# as the gamma flip — see `gamma_flip_from_matrix`.
+GAMMA_FLIP_MIN_SHARE = 1e-4
+
+# Furthest the flip may lie from the underlying price, as a share of it; a
+# crossing further away is reported as no flip — see `gamma_flip_from_matrix`.
+GAMMA_FLIP_MAX_DISTANCE = 0.25
+
+
 def gamma_flip_price(
     df: pd.DataFrame,
     as_of: pd.Timestamp | None = None,
@@ -1319,7 +1329,7 @@ def gamma_flip_from_matrix(matrix: pd.DataFrame, spot: float) -> float | None:
     an edge: GLD had eleven, the first at 232.11 against a spot of 408.89; SPY
     reported 496.33 against 769.74.
 
-    Two rules, and both are needed — each leaves a real chain wrong on its own.
+    Four rules, and all are needed — each leaves a real chain wrong without it.
 
     A CROSSING IS A CHANGE BETWEEN A STRICTLY POSITIVE AND A STRICTLY NEGATIVE
     TOTAL, so strikes carrying no exposure at all take no part. `np.sign` maps
@@ -1341,7 +1351,50 @@ def gamma_flip_from_matrix(matrix: pd.DataFrame, spot: float) -> float | None:
     it differs from this one in 3 of those 200 snapshots, and in all three it
     was the further of the two from the money (GLD 424.13 against 421.37 with
     the spot at 421.37). It is also the rule that fails the same way the old one
-    did, only upwards, as soon as a chain carries junk above the money."""
+    did, only upwards, as soon as a chain carries junk above the money.
+
+    A CROSSING HAS TO SEPARATE TWO SIGNIFICANT VALUES, and the nearest-crossing
+    rule needs this third one beneath it: when the profile never changes sign
+    anywhere near the money, the nearest crossing left is the noise far below
+    it. SPY with the spot at 766 reported a flip of 348.81: the cumulative sum
+    there wandered between +$0.4K and +$5K while the profile reached -$1.5B and
+    stayed negative all the way up — a curve grazing zero, not changing regime.
+    So a value takes part only once its magnitude exceeds
+    `GAMMA_FLIP_MIN_SHARE` of the profile's largest absolute value, and a
+    crossing counts when the nearest such values on either side of it have
+    opposite signs. Where it counts, the level is still interpolated between
+    the two strikes that bracket the actual sign change, so a crossing that
+    passes keeps exactly the level it had. One that does not pass is the same
+    answer as no sign change at all: no flip level in this range. The share is
+    relative because GEX has no natural unit across tickers. A window around
+    the spot was the other candidate and is the wrong instrument: it measures
+    distance, not size, so it would keep a graze that happens to lie near the
+    money and drop a genuine flip on a name that moves ten percent a week.
+    On daily profiles every graze measured did lie far away, but per expiry
+    some sit within 1-4% of the spot: an expiry hours from its close, whose
+    gamma off the money is at machine zero, or a dip of 2e-5 of the profile
+    between two positive values — exactly the cases a window would keep.
+    The share's value comes from the gap between the two populations on 209
+    daily profiles of eleven tickers: the grazing crossings peak at 1.8e-5 of
+    the profile, all of them 38-76% away from the spot, and the next crossing
+    up reaches 3.6e-4. Every share from 3e-5 to 3e-4 drops the same fifteen and
+    moves no other flip; 1e-4 sits in the middle of that range on a log scale,
+    a factor of five from the noise and three and a half from the weakest
+    crossing kept.
+
+    A FLIP MORE THAN `GAMMA_FLIP_MAX_DISTANCE` FROM THE PRICE IS NO FLIP. The
+    size rule keeps a real crossing wherever it is, and the next real one can
+    lie on the far side of the money: GLD with the spot at 378 had its flip
+    jump from 212 to 627 once a graze below stopped counting. A level 65% away
+    does not answer "how far is the regime change from here" any better than
+    the graze did, so the nearest crossing that passes is still dropped when it
+    lies further than a quarter of the price away. A quarter because the
+    question is about moves the shown expiries can plausibly see: it is about
+    one and a half monthly standard deviations for the most volatile chain
+    collected (implied volatility near 57%), seven for an index at 13%. A
+    tighter cut starts removing levels a volatile name does reach within the
+    month; on 594 daily snapshots it drops 11 of 484 weather flips (2.3%), the
+    furthest 42% away."""
     if matrix.empty:
         return None
 
@@ -1385,21 +1438,38 @@ def _running_totals(values: np.ndarray) -> np.ndarray:
 
 def _nearest_crossing(strikes: np.ndarray, totals: np.ndarray, reference: float) -> float | None:
     """Crossings of the cumulative profile between strictly signed values,
-    interpolated linearly; the one nearest the reference, the first on a tie."""
+    interpolated linearly; of those whose nearest significant values on either
+    side differ in sign, the one nearest the reference, the first on a tie —
+    or None if even that one is further from it than `GAMMA_FLIP_MAX_DISTANCE`."""
     cumulative = np.cumsum(totals)
     carrying = np.flatnonzero(cumulative)
     if len(carrying) < 2:
         return None
-    y0, y1 = cumulative[carrying[:-1]], cumulative[carrying[1:]]
+    before, after = carrying[:-1], carrying[1:]
+    y0, y1 = cumulative[before], cumulative[after]
     change = np.sign(y0) != np.sign(y1)
+    # Indices of the values large enough to take part (`gamma_flip_from_matrix`,
+    # third rule). At least one exists: the largest value exceeds any share of
+    # itself below one, since `carrying` is not empty.
+    magnitude = np.abs(cumulative)
+    significant = np.flatnonzero(magnitude > GAMMA_FLIP_MIN_SHARE * magnitude.max())
+    left = np.searchsorted(significant, before, side="right") - 1
+    right = np.searchsorted(significant, after, side="left")
+    bracketed = (left >= 0) & (right < len(significant))
+    left_sign = np.sign(cumulative[significant[np.clip(left, 0, len(significant) - 1)]])
+    right_sign = np.sign(cumulative[significant[np.clip(right, 0, len(significant) - 1)]])
+    change &= bracketed & (left_sign != right_sign)
     if not change.any():
         return None
-    x0, x1 = strikes[carrying[:-1]][change], strikes[carrying[1:]][change]
+    x0, x1 = strikes[before][change], strikes[after][change]
     y0, y1 = y0[change], y1[change]
     # y0 and y1 are nonzero with opposite signs, so they cannot be equal and
     # the interpolation cannot divide by zero.
     crossings = x0 + (0 - y0) * (x1 - x0) / (y1 - y0)
-    return float(crossings[np.argmin(np.abs(crossings - reference))])
+    nearest = crossings[np.argmin(np.abs(crossings - reference))]
+    if abs(nearest - reference) > GAMMA_FLIP_MAX_DISTANCE * abs(reference):
+        return None
+    return float(nearest)
 
 
 _CONTRACT_KEYS = ["expiry", "strike", "option_type"]

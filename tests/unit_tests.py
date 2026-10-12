@@ -1396,6 +1396,22 @@ def check_the_batched_gex_path_returns_the_old_numbers():
     print("batched GEX checks passed (one matrix, the same numbers)")
 
 
+def _matrix_with_cumulative(cumulative: dict[float, float]) -> pd.DataFrame:
+    """A one-column matrix whose cumulative profile is exactly `cumulative`.
+
+    Written the other way round on purpose: the argument is the shape the
+    flip walks over, so the assertions can be read against it without anyone
+    summing five numbers in their head.
+    """
+    strikes = sorted(cumulative)
+    running = 0.0
+    per_strike = []
+    for strike in strikes:
+        per_strike.append(cumulative[strike] - running)
+        running = cumulative[strike]
+    return pd.DataFrame({pd.Timestamp("2026-09-18"): per_strike}, index=pd.Index(strikes, name="strike"))
+
+
 def check_the_flip_is_the_crossing_by_the_money():
     """The flip must be the zero crossing nearest the underlying price.
 
@@ -1416,21 +1432,7 @@ def check_the_flip_is_the_crossing_by_the_money():
     """
     expiry = pd.Timestamp("2026-09-18")
     spot = 320.0
-
-    def matrix_with(cumulative: dict[float, float]) -> pd.DataFrame:
-        """A one-column matrix whose cumulative profile is exactly `cumulative`.
-
-        Written the other way round on purpose: the argument is the shape the
-        function under test walks over, so the assertions below can be read
-        against it without anyone summing five numbers in their head.
-        """
-        strikes = sorted(cumulative)
-        running = 0.0
-        per_strike = []
-        for strike in strikes:
-            per_strike.append(cumulative[strike] - running)
-            running = cumulative[strike]
-        return pd.DataFrame({expiry: per_strike}, index=pd.Index(strikes, name="strike"))
+    matrix_with = _matrix_with_cumulative
 
     three = matrix_with({130.0: 1.0, 140.0: -1.0, 300.0: -8000.0,
                          310.0: 12000.0, 600.0: 3000.0, 610.0: -500.0})
@@ -1499,6 +1501,103 @@ def check_the_flip_is_the_crossing_by_the_money():
     ), f"the chain-side entry stopped reading the spot off the snapshot: {by_chain} vs {by_hand}"
 
     print("Gamma flip picks the crossing by the money (3 crossings, deep wobble ignored)")
+
+
+def check_a_grazing_crossing_is_not_a_flip():
+    """A crossing counts only between values of significant size.
+
+    Found 12.10.2026 on SPY 2026-09-08 with the spot at 766: the flip came back
+    348.81. Far below the money the cumulative profile wandered between +$0.4K
+    and +$5K, then fell to -$1.5B and stayed negative all the way up — net GEX
+    -0.64B, no regime change anywhere near the price. With no real crossing to
+    prefer, "nearest to the spot" kept the only one there was: a curve grazing
+    zero 418 points below the money. The fix makes a crossing count only when
+    the nearest values on either side larger than GAMMA_FLIP_MIN_SHARE of the
+    profile's peak have opposite signs. Own data: matrices this test builds.
+    """
+    from app import metrics_core as core
+
+    spot = 766.0
+    share = core.GAMMA_FLIP_MIN_SHARE
+
+    # The SPY shape: a positive wobble of a few thousand dollars, then -$1.5B.
+    # Moved up to 640, inside the distance rule's reach (next check), so that
+    # only the size of the wobble can drop it.
+    grazing = _matrix_with_cumulative({600.0: 400.0, 620.0: 5000.0, 640.0: 3000.0, 650.0: -20000.0,
+                                       700.0: -1.5e9, 766.0: -9e8, 800.0: -6.4e8})
+    got = metrics.gamma_flip_from_matrix(grazing, spot)
+    assert got is None, (
+        f"a profile that only grazes zero below the money reported a flip of {got} — "
+        f"about 641.3 means the +$5K wobble against a -$1.5B profile is still read as a regime change"
+    )
+    assert core.gamma_flip_by_depth(grazing, np.ones((1, len(grazing)), dtype=bool), spot) == [None]
+
+    # The same graze at the top end: the profile climbs from -$1.5B to a few
+    # thousand dollars above zero at its last strike. Not a flip either.
+    grazing_up = _matrix_with_cumulative({600.0: -1.5e9, 760.0: -3e8, 900.0: -2000.0, 910.0: 3000.0})
+    assert metrics.gamma_flip_from_matrix(grazing_up, spot) is None
+
+    # A real flip next to the money survives, at exactly the level the old
+    # rule gave it: the interpolation is between the two strikes that bracket
+    # the sign change, whatever the graze below does.
+    real = _matrix_with_cumulative({300.0: 400.0, 320.0: 5000.0, 340.0: 3000.0, 350.0: -20000.0,
+                                    650.0: -1.5e9, 760.0: -2e8, 770.0: 3e8, 800.0: 1e8})
+    got = metrics.gamma_flip_from_matrix(real, spot)
+    assert got is not None and abs(got - 764.0) < 1e-9, f"the flip next to the money moved or vanished: {got}"
+
+    # Where the graze is nearer the spot than the real crossing, the old rule
+    # took the graze; the real one, further away, is the answer now.
+    far_real = _matrix_with_cumulative({480.0: 400.0, 490.0: 5000.0, 500.0: 3000.0, 510.0: -20000.0,
+                                        520.0: -1.5e9, 700.0: -2e8, 710.0: 3e8})
+    got = metrics.gamma_flip_from_matrix(far_real, 600.0)
+    assert got is not None and abs(got - 704.0) < 1e-9, (
+        f"with the spot at 600 the flip came back {got}, not the real crossing at 704.0; "
+        f"about 501.3 means the graze is still preferred for being nearer"
+    )
+
+    # The boundary is the share of the peak: a wobble twice the share is a
+    # crossing, half of it is not. Pins the constant's meaning, not its value.
+    peak = 1.5e9
+    for wobble, kept in ((peak * share * 2, True), (peak * share / 2, False)):
+        edge = _matrix_with_cumulative({300.0: wobble, 350.0: -peak, 800.0: -peak / 2})
+        got = metrics.gamma_flip_from_matrix(edge, 330.0)
+        assert (got is not None) == kept, (wobble / peak, got)
+
+    print(f"Gamma flip ignores a graze of zero (share {share:g} of the profile's peak)")
+
+
+def check_a_far_flip_is_no_flip():
+    """A crossing further than GAMMA_FLIP_MAX_DISTANCE from the price is no flip.
+
+    Owner's decision 12.10.2026, after the graze rule above: with a graze below
+    the money no longer counting, GLD's heatmap flip jumped from 212 to 627
+    against a spot of 378 — a real crossing, 65% away, and no more use to the
+    reader than the graze was. The rule drops the nearest crossing that passes
+    when it lies further than a quarter of the price away, strictly. Own data.
+    """
+    from app import metrics_core as core
+
+    reach = core.GAMMA_FLIP_MAX_DISTANCE
+    spot = 400.0
+    # One real crossing at exactly spot * (1 + offset): the profile is -1e9 one
+    # point below that level and +1e9 one point above, so it crosses midway.
+    for offset, kept in ((reach - 0.01, True), (reach, True), (reach + 0.01, False), (-(reach + 0.01), False)):
+        level = spot * (1 + offset)
+        matrix = _matrix_with_cumulative({level - 1.0: -1e9, level + 1.0: 1e9})
+        got = metrics.gamma_flip_from_matrix(matrix, spot)
+        assert (got is not None) == kept, (
+            f"a crossing {offset:+.0%} from the price came back {got}; "
+            f"the reach is {reach:.0%} and only a flip within it is shown"
+        )
+        assert core.gamma_flip_by_depth(matrix, np.ones((1, 2), dtype=bool), spot) == [got]
+
+    # The rule looks at the nearest crossing that passes, so a far one behind a
+    # near one changes nothing.
+    both = _matrix_with_cumulative({380.0: -1e9, 382.0: 1e9, 640.0: 1e9, 642.0: -1e9})
+    got = metrics.gamma_flip_from_matrix(both, spot)
+    assert got is not None and abs(got - 381.0) < 1e-9, got
+
+    print(f"Gamma flip further than {reach:.0%} from the price is not shown")
 
 
 def check_gamma_flip_by_depth_is_each_crop():
@@ -2145,6 +2244,17 @@ def check_every_weather_state_has_its_picture():
         assert not sunny or art.count("<line") >= 3, state
     assert len(pictures) == len(states)
 
+    # No flip means none within the core's reach, not none in the strike
+    # range: a real crossing further away is dropped too, and the sentence
+    # has to say what was actually looked at.
+    from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
+
+    flipless = {"state": metrics.WEATHER_STORM, "net_gex": -1.0, "gamma_flip": None,
+                "underlying_price": 101.0, "collected_at": "2026-09-09 19:42"}
+    sentence = weather.describe(flipless)["sentence"]
+    assert f"no gamma flip within {GAMMA_FLIP_MAX_DISTANCE:.0%} of the price" in sentence, sentence
+    assert "strike range" not in sentence, sentence
+
     print("weather glyph checks passed (five states, five pictures, colours by regime)")
 
 
@@ -2517,6 +2627,8 @@ def main():
     check_symbols_the_source_will_not_serve_are_explained()
     check_the_batched_gex_path_returns_the_old_numbers()
     check_the_flip_is_the_crossing_by_the_money()
+    check_a_grazing_crossing_is_not_a_flip()
+    check_a_far_flip_is_no_flip()
     check_gamma_flip_by_depth_is_each_crop()
     check_normal_kernels_are_scipys()
     check_expiry_moment_cache_changes_nothing()

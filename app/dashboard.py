@@ -29,6 +29,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     theme,
     weather,
 )
+from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
 from app.viewtime import (
     format_date,
     format_datetime,
@@ -1604,6 +1605,13 @@ if active_view == "GEX Heatmap":
                 "support/resistance levels created by dealer hedging flows.\n\n"
                 "**Gamma Flip** — the approximate underlying price at which total GEX across the "
                 "shown expiries flips sign (linear interpolation between the nearest strikes). "
+                "The cumulative profile can cross zero several times far from the money, where "
+                "exposure is near nothing. A crossing counts only if the profile reaches a "
+                "meaningful size on both sides of it — a curve that merely grazes zero is not a "
+                "flip — and of the crossings that count, the level shown is the one nearest the "
+                "current price. No flip is shown when none count, or when the nearest one is "
+                f"more than {GAMMA_FLIP_MAX_DISTANCE:.0%} away from the price; then only the "
+                "regime is known. "
                 "This is not a re-pricing of greeks at hypothetical underlying prices (more "
                 "accurate but noticeably more expensive to compute), but a proxy based on the "
                 "already-computed profile at the current price — the same class of assumption as "

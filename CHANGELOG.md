@@ -69,6 +69,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   differently depending on the day its image was built.
 
 ### Fixed
+- **A curve that only grazes zero is no longer reported as the gamma flip,
+  and neither is a crossing more than 25% from the price.** Far from the
+  money the cumulative GEX profile can wander a few thousand dollars either
+  side of zero while the profile near the price is a billion or more of one
+  sign, and when nothing else crossed, "the crossing nearest the price" was
+  that graze: SPY with the price at 766 showed a flip of 348.81. A crossing
+  now counts only when the profile reaches a meaningful size on both sides of
+  it (more than one ten-thousandth of its largest value), and the nearest one
+  that counts is still dropped when it lies more than 25% from the price —
+  with a graze below no longer counting, the next real crossing can be on the
+  far side of the money, and a level that far away says no more about the
+  regime than the graze did. A flip that passes both rules keeps exactly the
+  level it had. The weather card without a flip now says "no gamma flip
+  within 25% of the price" instead of "inside its strike range", which was
+  no longer what it meant, and the heatmap's "How to read this" explains
+  both rules. The formulas are the hosted product's, byte for byte
+  (`app/metrics_core.py`, sha256 `de8bc89c…`); day rows written by the
+  previous formulas are rebuilt by the worker on its next daily pass, as
+  far back as `DAY_SUMMARY_BACKFILL_DAYS` reaches (45 days by default).
 - **The gamma-weather glyphs are the hosted version's again.** Unsettled was
   drawn as a green dot beside a cloud and a bolt, where the hosted product
   draws a sun with rays behind the cloud — both regimes visibly in play — and
