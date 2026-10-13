@@ -112,11 +112,17 @@ def rollup_fixture_days(closed: int = 3, today: dt.date | None = None) -> list[d
     trading days and a fixture of weekend copies would collapse into one
     bucket. They are strictly before today so that the two rules can never
     disagree about the newest one — whatever day of the week it is.
+
+    Trading days by the exchange calendar, holidays included: the per-day
+    readers do not count a holiday as a day, so a completed day that was one
+    would be a fixture day the code under check rightly ignores.
     """
+    from app import market_calendar  # here, not at the top: configure() runs before any app import
+
     anchor = today or dt.date.today()
     completed, day = [], anchor - dt.timedelta(days=1)
     while len(completed) < closed:
-        if day.isoweekday() <= 5:
+        if market_calendar.session_times(day)[0] is not None:
             completed.append(day)
         day -= dt.timedelta(days=1)
     return [*reversed(completed), anchor]

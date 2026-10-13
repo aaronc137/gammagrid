@@ -4,6 +4,7 @@ a connection directly."""
 from __future__ import annotations
 
 import datetime as dt
+import math
 import warnings
 from datetime import datetime
 
@@ -520,6 +521,38 @@ def get_recent_runs(conn: psycopg.Connection, limit: int = 50) -> pd.DataFrame:
     )
 
 
+# The words the collector's zero-open-interest guard writes into the run log
+# (collector.ZeroOpenInterestChain). Matched rather than stored in a column of
+# its own: the run log is the state, and rows written before this distinction
+# existed carry the same words, so they are classified the same way without a
+# migration.
+ZERO_OI_REFUSAL = "of contracts have open_interest=0"
+
+
+def is_closed_market_refusal(started_at, error_message: str | None) -> bool:
+    """Whether a failed run was the zero-open-interest guard firing while the
+    market was shut — an outcome, not a failure.
+
+    Outside regular hours Yahoo serves chains with open interest zeroed on
+    83–97% of contracts (measured on the run log collected here), and the
+    guard rightly refuses to store them. Counted as failures, the single
+    snapshot the worker takes on each closed day added up — Saturday, Sunday,
+    Monday before the open — to the three that make every screen say
+    "Collection for this symbol is failing", on every symbol at once, about a
+    market that was simply closed.
+
+    BOTH HALVES ARE NEEDED. The same guard firing during a session is a
+    corrupted snapshot and is a failure; any other error on a closed day — a
+    symbol that has gone, a source refusing requests — is a failure too. The
+    calendar decides "closed", holidays and half-days included.
+    """
+    return (
+        bool(error_message)
+        and ZERO_OI_REFUSAL in error_message
+        and market_calendar.state_from_clock(started_at) == market_calendar.CLOSED
+    )
+
+
 def unresolvable_tickers(
     conn: psycopg.Connection, limit: int | None = None
 ) -> dict[str, datetime]:
@@ -551,21 +584,23 @@ def unresolvable_tickers(
 
     Returns {ticker: when it was suspended}, the suspending failure's own
     timestamp, so the interface can say since when rather than just "off".
+
+    A closed-market refusal does not count (`is_closed_market_refusal`): a
+    symbol whose chain arrived, zeroed overnight, exists — and a symbol added
+    on a Friday evening would otherwise be suspended by a long weekend.
     """
     threshold = config.UNRESOLVABLE_AFTER_FAILURES if limit is None else limit
     rows = conn.execute(
-        """SELECT ticker, min(started_at) FROM (
-               SELECT ticker, started_at,
-                      row_number() OVER (PARTITION BY ticker ORDER BY started_at) AS n
-               FROM collection_runs
-               WHERE status = 'failed'
-                 AND ticker NOT IN (SELECT ticker FROM collection_runs WHERE status = 'success')
-           ) ranked
-           WHERE n >= %(limit)s
-           GROUP BY ticker""",
-        {"limit": threshold},
+        """SELECT ticker, started_at, error_message FROM collection_runs
+           WHERE status = 'failed'
+             AND ticker NOT IN (SELECT ticker FROM collection_runs WHERE status = 'success')
+           ORDER BY ticker, started_at"""
     ).fetchall()
-    return {row[0].upper(): row[1] for row in rows}
+    counted: dict[str, list[datetime]] = {}
+    for ticker, started_at, message in rows:
+        if not is_closed_market_refusal(started_at, message):
+            counted.setdefault(ticker.upper(), []).append(started_at)
+    return {ticker: moments[threshold - 1] for ticker, moments in counted.items() if len(moments) >= threshold}
 
 
 def store_realized_volatility(
@@ -674,6 +709,11 @@ def collection_state(
 
     The timestamp comes back naive and is UTC by the collector's convention,
     the same as every other moment in this schema.
+
+    A closed-market refusal is not a failure (`is_closed_market_refusal`).
+    The guard's runs come back as moments rather than as a count, because
+    which of them happened with the market shut is the exchange calendar's
+    answer, not SQL's; every other failure is counted in the query.
     """
     row = conn.execute(
         """WITH last_ok AS (
@@ -681,18 +721,24 @@ def collection_state(
                FROM collection_runs
                WHERE ticker = %(ticker)s AND status = 'success'
                  AND (%(source)s::text IS NULL OR source = %(source)s::text)
+           ), since AS (
+               SELECT started_at, strpos(coalesce(error_message, ''), %(guard)s) > 0 AS guard
+                 FROM collection_runs
+                WHERE ticker = %(ticker)s AND status = 'failed'
+                  AND (%(source)s::text IS NULL OR source = %(source)s::text)
+                  AND (started_at > (SELECT at FROM last_ok) OR (SELECT at FROM last_ok) IS NULL)
            )
            SELECT (SELECT at FROM last_ok),
-                  (SELECT count(*) FROM collection_runs
-                    WHERE ticker = %(ticker)s AND status = 'failed'
-                      AND (%(source)s::text IS NULL OR source = %(source)s::text)
-                      AND (started_at > (SELECT at FROM last_ok)
-                           OR (SELECT at FROM last_ok) IS NULL))""",
-        {"ticker": ticker.upper(), "source": source},
+                  (SELECT count(*) FROM since WHERE NOT guard),
+                  (SELECT coalesce(array_agg(started_at), '{}') FROM since WHERE guard)""",
+        {"ticker": ticker.upper(), "source": source, "guard": ZERO_OI_REFUSAL},
     ).fetchone()
     if row is None:
         return None, 0
-    return row[0], int(row[1] or 0)
+    in_session = sum(
+        1 for at in row[2] or [] if not is_closed_market_refusal(at, ZERO_OI_REFUSAL)
+    )
+    return row[0], int(row[1] or 0) + in_session
 
 
 def collection_depth(conn: psycopg.Connection) -> dict[str, dt.date]:
@@ -826,15 +872,62 @@ def set_collector_interval(conn: psycopg.Connection, minutes: int) -> None:
     set_setting(conn, COLLECTOR_INTERVAL_KEY, str(int(minutes)))
 
 
-def estimated_growth_mb_per_month(conn: psycopg.Connection, interval_minutes: int) -> float:
+# How many of a ticker's latest successful collections its chain size is
+# averaged over. Recent rather than all of them: a chain grows and shrinks as
+# expiries are listed and roll off, and the estimate is about the month ahead.
+_RUNS_PER_ESTIMATE = 10
+
+
+def rows_per_pass_by_ticker(conn: psycopg.Connection) -> dict[str, float | None]:
+    """How many snapshot rows one collection pass writes, per watched ticker.
+
+    PER TICKER, BECAUSE A PASS IS ONE COLLECTION PER TICKER. Every ticker in a
+    pass is stored under its own `collected_at`, so the rows of one moment are
+    one ticker's chain, never the whole watchlist's. The estimate used to divide
+    all rows by all moments and so priced one average chain per pass — on a
+    five-ticker watchlist it said 0.1 GB a month for what costs 1.5.
+
+    Read from the collection log rather than from the snapshots: `rows_fetched`
+    is what each successful run stored, the log is small and indexed by
+    ticker, and it still has the count after the archive has moved a past
+    chain's expired contracts out of the hot table. A ticker with no successful
+    run yet maps to None — nothing to measure, and the caller says so rather
+    than counting it as free. Tickers no longer watched are not asked about.
+    """
+    rows = conn.execute(
+        """SELECT w.ticker, avg(r.rows_fetched)::float
+             FROM watchlist w
+             LEFT JOIN LATERAL (
+                   SELECT rows_fetched
+                     FROM collection_runs
+                    WHERE ticker = w.ticker AND status = 'success'
+                      AND COALESCE(rows_fetched, 0) > 0
+                    ORDER BY started_at DESC
+                    LIMIT %s
+             ) r ON true
+            GROUP BY w.ticker
+            ORDER BY w.ticker""",
+        (_RUNS_PER_ESTIMATE,),
+    ).fetchall()
+    return {ticker: (float(avg) if avg is not None else None) for ticker, avg in rows}
+
+
+def estimated_growth_mb_per_month(
+    conn: psycopg.Connection,
+    interval_minutes: int,
+    rows_by_ticker: dict[str, float | None] | None = None,
+) -> float:
     """What continuous collection will cost on disk, for THIS watchlist.
 
-    Answered from the rows already collected rather than from a guess: the
-    average chain size differs by an order of magnitude between a single small
-    ticker and a handful of index ETFs, so a generic number would be wrong in
-    the only direction that matters. With nothing collected yet there is
-    nothing to measure and the answer is zero — the interface says so rather
-    than inventing a figure.
+    Answered from the chains already collected rather than from a guess: chain
+    size differs by two orders of magnitude between a small single stock and an
+    index (MO stores about 500 rows a collection, SPX about 17,800), so a
+    generic number would be wrong in the only direction that matters. One pass
+    writes every watched ticker's chain, so the rows per pass are the sum of
+    `rows_per_pass_by_ticker` — tickers not collected yet contribute nothing,
+    and with nothing collected at all the answer is zero, which the interface
+    says rather than inventing a figure. `rows_by_ticker` is that mapping when
+    the caller already has it (to name the tickers left out).
 
     This exists to be shown at the moment somebody switches collection on. A
     background process filling a stranger's disk without ever having named a
@@ -842,11 +935,9 @@ def estimated_growth_mb_per_month(conn: psycopg.Connection, interval_minutes: in
     """
     if interval_minutes <= 0:
         return 0.0
-    row = conn.execute(
-        """SELECT count(*)::float / GREATEST(count(DISTINCT collected_at), 1)
-           FROM option_snapshots"""
-    ).fetchone()
-    rows_per_pass = float(row[0] or 0)
+    if rows_by_ticker is None:
+        rows_by_ticker = rows_per_pass_by_ticker(conn)
+    rows_per_pass = sum(rows for rows in rows_by_ticker.values() if rows is not None)
     return (
         rows_per_pass
         * _passes_per_month(interval_minutes)
@@ -880,10 +971,21 @@ def _passes_per_month(interval_minutes: int) -> float:
     somebody decides whether to switch collection on at all, and a fivefold
     exaggeration can make that decision for them.
 
-    Fractional passes per session are deliberate and not rounded up. At a
-    4-hour interval a 6.5-hour session gets 1.625 collections — some days two,
-    some days one — and rounding that to two would reintroduce a smaller
-    version of the same overstatement.
+    A SESSION GETS A WHOLE NUMBER OF PASSES, the first at the bell. This used
+    to count 390 / interval of them — 6.5 an hour, 1.625 at four hours — on
+    the reasoning that some days get two and some one. None do: the worker
+    never sleeps past the open (`worker.sleep_seconds`), so every session
+    starts with a pass at 09:30 and then one per interval while the market is
+    open — 09:30, 10:30 … 15:30 is seven at an hourly interval, and 09:30 and
+    13:30 are two at four hours, every day. The local install's own log shows
+    it: a session collected hourly from the open starts at 09:30 and 10:30.
+
+    The closed days keep their one snapshot each. A trading day's own
+    closed-market snapshot, taken overnight before the open, is not counted:
+    at that hour the source serves most chains with open interest zeroed, the
+    quality check refuses them, and nothing is stored — on 13 of the 16 such
+    nights in the local install's log. Counting it would add an eighth to the
+    figure at hourly to cover the odd night it succeeds.
 
     The session length is read from market_calendar rather than written down
     again: it is the module that decides when the collector actually runs, so
@@ -893,7 +995,7 @@ def _passes_per_month(interval_minutes: int) -> float:
         dt.datetime.combine(dt.date.min, market_calendar.CLOSE_TIME)
         - dt.datetime.combine(dt.date.min, market_calendar.OPEN_TIME)
     ).total_seconds() / 60
-    passes_per_session = max(open_minutes / interval_minutes, 1.0)
+    passes_per_session = max(math.ceil(open_minutes / interval_minutes), 1)
     return _TRADING_DAYS_PER_MONTH * passes_per_session + _CLOSED_DAYS_PER_MONTH
 
 
@@ -1045,8 +1147,9 @@ def get_collection_moments(
     size of the answer — measured on the hosted product at 946 ms to read 3.26M
     index entries and return 247 values.
 
-    `per_day=True` returns the last collection of each calendar day, which is
-    what every metric built on daily history actually uses.
+    `per_day=True` returns the last collection of each trading day, which is
+    what every metric built on daily history actually uses — and only of days
+    whose session had opened by then (`market_calendar.session_started`).
 
     Scoped to one source like every other read. A run recorded before the
     source column existed reads as 'yahoo', which is what it was.
@@ -1086,7 +1189,16 @@ def get_collection_moments(
             SELECT started_at FROM collection_runs WHERE {where}
             ORDER BY started_at DESC
         """
-    return [row[0] for row in conn.execute(statement, params).fetchall()]  # noqa: S608
+    moments = [row[0] for row in conn.execute(statement, params).fetchall()]  # noqa: S608
+    if per_day:
+        # The rest of the day rule, in Python because it needs the exchange
+        # calendar: SQL can drop a Saturday, but only the calendar knows Labor
+        # Day, and only the clock knows that a day whose last collection is
+        # 00:14 in New York had not traded yet. The DAY is dropped rather than
+        # an earlier collection reached for — DISTINCT ON already took the
+        # last one, so if that was before the open, every one of them was.
+        moments = [moment for moment in moments if market_calendar.session_started(moment)]
+    return moments
 
 
 def get_snapshots_at(
@@ -1479,49 +1591,106 @@ def upsert_day_summary(
     conn.commit()
 
 
-def get_day_summary(
-    conn: psycopg.Connection, ticker: str, source: str, day: dt.date | None = None
-) -> dict | None:
-    """The row for one day — the newest day when None — or None."""
-    filter_day = "AND day = %(day)s" if day is not None else ""
+def _is_session_day_row(day: dt.date, collected_at) -> bool:
+    """Whether a stored day row describes a session that had opened.
+
+    Two ways to fail, and rows written before this rule existed show both: the
+    collection came before that day's open (a weekend, a holiday, the 00:1x
+    snapshot of a closed market), or the row is filed under a day that is not
+    its collection's own New York day.
+    """
+    return market_calendar.session_started(collected_at) and market_calendar.market_day(collected_at) == day
+
+
+def _session_days(conn: psycopg.Connection, ticker: str, source: str) -> list[dt.date]:
+    """The days on record that are trading days, newest first.
+
+    Filtered on read rather than trusted, so that rows an older build wrote for
+    a Saturday or a holiday are simply not there for any view — the cleanup
+    command removes them, but nothing depends on it having been run. The rule
+    needs the exchange calendar, so it is applied here and not in SQL; it reads
+    two narrow columns, a few hundred rows at most.
+    """
+    rows = conn.execute(
+        """SELECT day, collected_at FROM ticker_day_summary
+            WHERE ticker = %(ticker)s AND source = %(source)s
+            ORDER BY day DESC""",
+        {"ticker": ticker.upper(), "source": source},
+    ).fetchall()
+    return [day for day, collected_at in rows if _is_session_day_row(day, collected_at)]
+
+
+def _day_summary_on(conn: psycopg.Connection, ticker: str, source: str, day: dt.date) -> dict | None:
     record = conn.execute(
         f"""SELECT {", ".join(_DAY_SUMMARY_COLUMNS)} FROM ticker_day_summary
-             WHERE ticker = %(ticker)s AND source = %(source)s {filter_day}
-             ORDER BY day DESC LIMIT 1""",  # noqa: S608 — the filter is a fixed string
+             WHERE ticker = %(ticker)s AND source = %(source)s AND day = %(day)s""",  # noqa: S608 — constant columns
         {"ticker": ticker.upper(), "source": source, "day": day},
     ).fetchone()
     return None if record is None else _day_summary_row(record)
 
 
+def get_day_summary(
+    conn: psycopg.Connection, ticker: str, source: str, day: dt.date | None = None
+) -> dict | None:
+    """The row for one trading day — the newest when None — or None."""
+    days = _session_days(conn, ticker, source)
+    if day is None:
+        return _day_summary_on(conn, ticker, source, days[0]) if days else None
+    return _day_summary_on(conn, ticker, source, day) if day in days else None
+
+
 def previous_day_summary(
     conn: psycopg.Connection, ticker: str, source: str, before: dt.date
 ) -> dict | None:
-    """The newest row strictly before a day.
+    """The newest trading day's row strictly before a day.
 
-    "The previous trading day" as the table knows it, which skips weekends,
-    holidays and days nothing was collected without consulting a calendar —
-    the row exists or it does not.
+    "The previous trading day" as the table knows it: weekends, holidays and
+    days nothing was collected on are skipped because no session row exists
+    for them — a row filed for one by an older build is not one.
     """
-    record = conn.execute(
-        f"""SELECT {", ".join(_DAY_SUMMARY_COLUMNS)} FROM ticker_day_summary
-             WHERE ticker = %(ticker)s AND source = %(source)s AND day < %(before)s
-             ORDER BY day DESC LIMIT 1""",  # noqa: S608 — the column list is a constant
-        {"ticker": ticker.upper(), "source": source, "before": before},
-    ).fetchone()
-    return None if record is None else _day_summary_row(record)
+    earlier = [day for day in _session_days(conn, ticker, source) if day < before]
+    return _day_summary_on(conn, ticker, source, earlier[0]) if earlier else None
 
 
 def list_day_summaries(
     conn: psycopg.Connection, ticker: str, source: str, limit: int = 400
 ) -> list[dt.date]:
-    """The days on record, newest first — what the two date pickers offer."""
+    """The trading days on record, newest first — what the two date pickers offer."""
+    return _session_days(conn, ticker, source)[:limit]
+
+
+def drop_non_session_day_summaries(
+    conn: psycopg.Connection, tickers: list[str] | None = None, *, dry_run: bool = False
+) -> int:
+    """Delete the day rows of days whose session had not opened. Returns how
+    many rows went — or would go, under `dry_run`.
+
+    For rows an older build wrote: before the day rule asked the exchange
+    calendar, the worker filed a row for any day it collected on, including
+    the single snapshot it takes on a weekend, a holiday, and just after
+    midnight. Every reader already ignores them (`_session_days`); this makes
+    the table say what the views say. Run it twice and the second run finds
+    nothing — the backfill applies the same rule, so it does not put them back.
+
+    NOT SCOPED BY SOURCE, unlike every read in this file: a holiday is a holiday
+    whichever provider collected it, and a row left behind under the other
+    source would reappear the day it is switched back on. `tickers` narrows it.
+    """
+    where, params = "", {}
+    if tickers is not None:
+        where = " WHERE ticker = ANY(%(tickers)s)"
+        params["tickers"] = [t.upper() for t in tickers]
     rows = conn.execute(
-        """SELECT day FROM ticker_day_summary
-            WHERE ticker = %(ticker)s AND source = %(source)s
-            ORDER BY day DESC LIMIT %(limit)s""",
-        {"ticker": ticker.upper(), "source": source, "limit": limit},
+        f"SELECT ticker, source, day, collected_at FROM ticker_day_summary{where}", params  # noqa: S608
     ).fetchall()
-    return [r[0] for r in rows]
+    doomed = [(ticker, source, day) for ticker, source, day, at in rows if not _is_session_day_row(day, at)]
+    if dry_run or not doomed:
+        return len(doomed)
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            "DELETE FROM ticker_day_summary WHERE ticker = %s AND source = %s AND day = %s", doomed
+        )
+    return len(doomed)
 
 
 def get_moment_rollup(
@@ -1571,4 +1740,6 @@ def missing_day_summaries(
              ORDER BY p.started_at DESC""",  # noqa: S608 — the date expressions are constants
         {"ticker": ticker.upper(), "source": source, "days": days, "sha": core_sha},
     ).fetchall()
-    return [r[0] for r in rows]
+    # The same rule `get_collection_moments(per_day=True)` applies: a day the
+    # exchange had not opened is not a day to build a row for.
+    return [r[0] for r in rows if market_calendar.session_started(r[0])]

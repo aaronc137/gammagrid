@@ -97,6 +97,32 @@ def stylesheet() -> str:
     font-variant-numeric: tabular-nums;
   }}
 
+  /* A view's lesson in the Guide (app/guide.py), on the right end of its
+     "How to read this" label, where the hosted product puts it, and quiet
+     until pointed at like every other link in the chrome. It is its own
+     element placed just above the block: it takes no height and gives back
+     the gap the page would put after it, then sits down onto the label. */
+  [data-testid="stElementContainer"]:has(.gg-guide-link) {{
+    position: relative;
+    margin-bottom: -1rem;
+    z-index: 1;
+  }}
+  .gg-guide-link {{
+    position: absolute;
+    /* The middle of the label row below, which is about 2.5rem tall. */
+    top: 1.25rem;
+    right: 12px;
+    transform: translateY(-50%);
+    line-height: 20px;
+  }}
+  .gg-guide-link a {{
+    font-size: {TEXT_BASE};
+    color: {MUTED};
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  .gg-guide-link a:hover, .gg-guide-link a:focus-visible {{ color: {ACCENT_SOFT}; }}
+
   /* The summary panel above the views. */
   .gg-weather {{
     display: flex;
@@ -190,9 +216,16 @@ def stylesheet() -> str:
   }}
   .gg-ladder td {{
     padding: 7px 12px 7px 0;
-    border-top: 1px solid {GRID};
     vertical-align: baseline;
   }}
+  /* Rules between the rows and nothing else, as the hosted ladder draws them.
+     Streamlit boxes every cell of a markdown table on all four sides, and over
+     the page's grid that turned the ladder into graph paper: the eye had to
+     sort the table's lines from the background's before reading a number.
+     `table.` outweighs Streamlit's own selector for the same cells. */
+  table.gg-ladder th, table.gg-ladder td {{ border: none; }}
+  table.gg-ladder th {{ border-bottom: 1px solid {BORDER}; }}
+  table.gg-ladder td {{ border-bottom: 1px solid color-mix(in srgb, {BORDER} 60%, transparent); }}
   .gg-ladder .gg-num {{
     font-family: {FONT_MONO};
     font-variant-numeric: tabular-nums;

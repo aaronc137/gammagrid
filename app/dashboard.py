@@ -21,6 +21,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     day_summary,
     db,
     freshness,
+    guide,
     market_calendar,
     metrics,
     providers,
@@ -28,6 +29,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     theme,
     weather,
 )
+from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
 from app.viewtime import (
     format_date,
     format_datetime,
@@ -108,6 +110,13 @@ def _cached_collection_depth() -> dict[str, dt.date]:
 
 
 
+def howto(view: str, title: str = "ℹ️ How to read this", expanded: bool = False):
+    """A view's first explanation block, with its lesson in the Guide on the
+    right of the label (app/guide.py). Used as `with howto("Overview"):`."""
+    st.markdown(guide.link(view), unsafe_allow_html=True)
+    return st.expander(title, expanded=expanded)
+
+
 def render_option_detail(
     conn, df: pd.DataFrame, selected_ticker: str, tracked: pd.DataFrame,
     opt_expiry: pd.Timestamp, opt_strike: float, opt_type: str, key_prefix: str,
@@ -141,7 +150,7 @@ def render_option_detail(
     with price_column:
         st.subheader("Option price")
         st.line_chart(with_viewer_index(greeks_history)["last_price"], color=BRAND_PURPLE)
-    with st.expander("ℹ️ How to read this"):
+    with howto("Contract"):
         st.write(
             "Price history of this specific contract (last price at each collection). "
             "Compare the option's price action with the underlying's move and with the IV "
@@ -438,13 +447,19 @@ conn = db.get_connection()
 # default Streamlit. Deliberately NOT touching st.dataframe/st.data_editor
 # styling: dense tables need to stay plain and readable, not branded —
 # over-styling them would visually overload the page.
+#
+# THE GRID IS MUTED UNDER THE APP, as the hosted product mutes it: its lines
+# are the grid colour mixed 55/45 with the page background. At full strength
+# it is the right weight for a landing page with nothing on it and too heavy
+# under a screen of text — a ladder like Changes, set in plain ink on the bare
+# background, read as if printed on graph paper.
 st.markdown(
     """
     <style>
       .stApp {
         background-image:
-          linear-gradient(#1C2320 1px, transparent 1px),
-          linear-gradient(90deg, #1C2320 1px, transparent 1px);
+          linear-gradient(color-mix(in srgb, #1C2320 55%, #0A0C0B) 1px, transparent 1px),
+          linear-gradient(90deg, color-mix(in srgb, #1C2320 55%, #0A0C0B) 1px, transparent 1px);
         background-size: 64px 64px;
         background-position: center -1px;
       }
@@ -664,7 +679,7 @@ with st.sidebar:
         disabled=not watchlist,
         help="Best run while the US options market is open. Outside market "
         "hours, Yahoo Finance often reports open_interest=0 across the whole "
-        "chain, which fails the collection for that ticker.",
+        "chain; such a chain is not stored, and is not counted as a failure.",
     ):
         with st.spinner("Collecting data..."):
             results = collector.collect_watchlist(conn, watchlist)
@@ -675,6 +690,10 @@ with st.sidebar:
                 # A deliberate decision not to try is not an error, and dressing
                 # it in red teaches people to ignore the red.
                 st.warning(f"{ticker}: {status}")
+            elif status.startswith("closed"):
+                # Nor is the market being shut: the chain arrived, zeroed the way
+                # the source serves it outside hours, and was not stored.
+                st.info(f"{ticker}: {status}")
             else:
                 st.error(f"{ticker}: {status}")
 
@@ -706,12 +725,20 @@ with st.sidebar:
     # watchlist rather than from a generic figure — chain sizes differ by an
     # order of magnitude between one small ticker and a few index ETFs.
     if chosen_minutes > 0:
-        growth = db.estimated_growth_mb_per_month(conn, chosen_minutes)
+        rows_by_ticker = db.rows_per_pass_by_ticker(conn)
+        growth = db.estimated_growth_mb_per_month(conn, chosen_minutes, rows_by_ticker)
+        not_counted = [ticker for ticker, rows in rows_by_ticker.items() if rows is None]
         if growth > 0:
             st.caption(
                 f"About {growth / 1000:.1f} GB per month at this interval, for your current "
                 f"watchlist. Nothing is ever deleted; expired contracts move to a separate "
                 f"table after {config.CONTRACT_ARCHIVE_GRACE_DAYS} days."
+                + (
+                    f" Not counted yet: {', '.join(not_counted)} — "
+                    f"{'it has' if len(not_counted) == 1 else 'they have'} not been "
+                    "collected, so there is no chain size to measure."
+                    if not_counted else ""
+                )
             )
         else:
             st.caption(
@@ -779,7 +806,9 @@ with st.sidebar:
             "even if the request to the data source itself completed without a network error. "
             "The most common cause is collecting outside regular market hours — Yahoo Finance "
             "often reports open_interest=0 across the whole chain while the market is closed. "
-            "If a ticker keeps failing, try again during market hours."
+            "Those runs say so in `error_message` and are not counted as failures: they do not "
+            "raise the \"collection is failing\" note or suspend a symbol. The same refusal "
+            "during a session is a real failure."
         )
 
 
@@ -985,7 +1014,7 @@ if active_view == "Overview":
     # definition of the ratio and the oracle the tests check this against.
     pcr = db.get_put_call_ratio(conn, selected_ticker, days=history_days, source=page_source)
     st.line_chart(with_viewer_index(pcr)[["pcr_volume", "pcr_oi"]], color=[BRAND_PURPLE, BRAND_GREEN])
-    with st.expander("ℹ️ How to read this"):
+    with howto("Overview"):
         st.write(
             "The ratio of put to call volume/open interest. A value noticeably above "
             "0.7–1.0 usually signals a defensive/bearish stance, below — a bullish one. "
@@ -1241,11 +1270,14 @@ if active_view == "Changes":
                     color=[BRAND_GREEN, BRAND_PURPLE][: len(frame.columns)],
                 )
 
-            with st.expander("ℹ️ How to read this"):
+            with howto("Changes"):
                 st.write(
                     "Two trading days of your own collection, side by side. A day is New "
-                    "York's date, and the row describes that day's last collection — the "
-                    "same rule OI Delta uses, so the two views never disagree about what "
+                    "York's date, and the row describes that day's last collection. It "
+                    "counts only once that day's session has opened: weekends, exchange "
+                    "holidays and the snapshot taken overnight before the bell are not "
+                    "days of their own, so on a Monday the day before is Friday. The same "
+                    "rule OI Delta uses, so the two views never disagree about what "
                     "\"yesterday\" means.\n\n"
                     "Colour is reserved for the regime: green when the day moved towards "
                     "dealer hedging damping moves, purple when it moved towards amplifying "
@@ -1287,7 +1319,7 @@ if active_view == "Max Pain / GEX":
     st.subheader("Max Pain")
     mp = metrics.max_pain(latest_df, selected_expiry)
     st.metric("Max Pain strike", mp if mp is not None else "n/a")
-    with st.expander("ℹ️ How to read this"):
+    with howto("Max Pain / GEX"):
         st.write(
             "The strike at which total payouts by option sellers are minimal. The price at "
             "expiration statistically gravitates toward this level, since market makers "
@@ -1522,7 +1554,7 @@ if active_view == "GEX Heatmap":
                 row_height=row_height,
             )
 
-        with st.expander("ℹ️ How to read this"):
+        with howto("GEX Heatmap"):
             st.write(
                 "Each cell is the approximate GEX (Black-Scholes, same sign heuristic as on the "
                 "Max Pain/GEX tab) for a specific strike and expiry, computed on a single "
@@ -1546,6 +1578,13 @@ if active_view == "GEX Heatmap":
                 "support/resistance levels created by dealer hedging flows.\n\n"
                 "**Gamma Flip** — the approximate underlying price at which total GEX across the "
                 "shown expiries flips sign (linear interpolation between the nearest strikes). "
+                "The cumulative profile can cross zero several times far from the money, where "
+                "exposure is near nothing. A crossing counts only if the profile reaches a "
+                "meaningful size on both sides of it — a curve that merely grazes zero is not a "
+                "flip — and of the crossings that count, the level shown is the one nearest the "
+                "current price. No flip is shown when none count, or when the nearest one is "
+                f"more than {GAMMA_FLIP_MAX_DISTANCE:.0%} away from the price; then only the "
+                "regime is known. "
                 "This is not a re-pricing of greeks at hypothetical underlying prices (more "
                 "accurate but noticeably more expensive to compute), but a proxy based on the "
                 "already-computed profile at the current price — the same class of assumption as "
@@ -1587,7 +1626,7 @@ if active_view == "Volatility (IV)":
             "contract's price. They are being recomputed in the background while the "
             "collector runs — nothing to start, and the rest of this page is unaffected."
         )
-    with st.expander("ℹ️ How to read this"):
+    with howto("Volatility (IV)"):
         st.write(
             "Rising average IV usually precedes an anticipated move (earnings, news) or "
             "already reflects increased market uncertainty. Falling — the market is calming "
@@ -1792,7 +1831,7 @@ if active_view == "Screener":
         # precisely — exact numeric input removes that problem outright. Min/max
         # come from the actual data (full range = nothing filtered by default).
         INT_FILTER_COLUMNS = {"dte", "open_interest"}
-        with st.expander("🔍 Filters (ranges)", expanded=True):
+        with howto("Screener", "🔍 Filters (ranges)", expanded=True):
             filter_cols = st.columns(3)
             mask = pd.Series(True, index=screener.index)
             for i, (col_name, label) in enumerate(FILTER_SPECS):
@@ -1923,7 +1962,7 @@ if active_view == "Unusual Activity":
     )
     st.caption(f"Contracts found: {len(flagged)}")
     st.dataframe(flagged, use_container_width=True)
-    with st.expander("ℹ️ How to read this"):
+    with howto("Unusual Activity"):
         st.write(
             "A contract is flagged when today's volume statistically significantly exceeds "
             f"(z-score above {config.UNUSUAL_Z_THRESHOLD}) this specific contract's own "
@@ -1935,13 +1974,13 @@ if active_view == "Unusual Activity":
             "a large trade can be part of a hedge for an entirely different position.\n\n"
             "The data source's volume is cumulative since the start of the trading session, "
             "so the history for the mean/standard deviation is built from one (the latest) "
-            "snapshot per calendar day — multiple same-day collections are never mixed "
+            "snapshot per trading day — multiple same-day collections are never mixed "
             "together when computing the statistics."
         )
 
 if active_view == "OI Delta":
     st.subheader("Open Interest change (latest day vs. previous)")
-    # Two calendar days is the entire input to a day-over-day difference, and
+    # Two trading days is the entire input to a day-over-day difference, and
     # the days are named by the run log before any snapshot row is read.
     delta = metrics.oi_delta(
         db.get_snapshots_at(
@@ -1953,15 +1992,15 @@ if active_view == "OI Delta":
         )
     )
     if delta.empty:
-        st.info("Data from at least two distinct calendar days is needed to compute the OI change.")
+        st.info("Data from at least two distinct trading days is needed to compute the OI change.")
     else:
         st.dataframe(delta, use_container_width=True)
-        with st.expander("ℹ️ How to read this"):
+        with howto("OI Delta"):
             st.write(
                 "`open_interest` — the current value as of the latest day, for scale: a "
                 "1000-contract increase is a lot at OI=2000 and barely noticeable at "
                 "OI=200000. `oi_delta` — the absolute signed change: positive — new "
-                "positions opened at this strike over the last calendar day (OI grew), "
+                "positions opened at this strike since the previous trading day (OI grew), "
                 "negative — some positions closed. `oi_delta_pct` — the same change as a "
                 "percentage of the previous value (empty if the previous OI was 0 — growth "
                 "\"from zero\" has no percentage form). Rows are sorted by the magnitude of "
@@ -1970,7 +2009,9 @@ if active_view == "OI Delta":
                 "of sign) that most often form new dealer hedging-flow levels (see the Max "
                 "Pain/GEX tab).\n\n"
                 "The data source's open interest barely updates intraday, so the comparison "
-                "is between the latest snapshots of two distinct calendar days rather than "
+                "is between the latest snapshots of two distinct trading days rather than "
                 "the two most recent collections — if you collected data several times "
-                "today, only the freshest collection of the day is used for the comparison."
+                "today, only the freshest collection of the day is used for the comparison. "
+                "A day counts once its session has opened: before the bell, and on weekends "
+                "and holidays, the comparison is between the last two sessions."
             )

@@ -198,7 +198,18 @@ def check_collector_isolation():
                 raise RuntimeError("provider exploded")
             return 100.0, chain(zero_oi=(ticker == "ZEROOI"))
 
-    results = collector.collect_watchlist(conn, ["GOOD", "BOOM", "ZEROOI"], provider=Fake())
+    # On a Wednesday at 11:00 New York, so that the zero-OI refusal is the
+    # in-session kind whatever the clock says when the suite runs.
+    real_now = collector._now_utc
+    collector._now_utc = lambda: datetime(2026, 9, 16, 15, 0)
+    try:
+        results = collector.collect_watchlist(conn, ["GOOD", "BOOM", "ZEROOI"], provider=Fake())
+        # The same chain on a Saturday: refused just the same, and said to be the
+        # market being shut rather than a failure.
+        collector._now_utc = lambda: datetime(2026, 9, 19, 16, 0)
+        closed = collector.collect_watchlist(conn, ["ZEROOI"], provider=Fake())
+    finally:
+        collector._now_utc = real_now
 
     assert results["GOOD"] == "success", results
     assert results["BOOM"].startswith("failed"), results
@@ -207,6 +218,8 @@ def check_collector_isolation():
     # looks ordinary but silently breaks the GEX heatmap and OI delta.
     assert results["ZEROOI"].startswith("failed"), results
     assert "open_interest=0" in results["ZEROOI"], results["ZEROOI"]
+    assert closed["ZEROOI"].startswith("closed: "), closed
+    assert db.ZERO_OI_REFUSAL in closed["ZEROOI"], closed
     assert len(db.get_snapshots(conn, "GOOD", days=None)) == 2
     assert db.get_snapshots(conn, "ZEROOI", days=None).empty, "a refused snapshot must not be stored"
     # Every attempt is logged, successful or not — the collection log is the
@@ -831,13 +844,87 @@ def check_disk_estimate_respects_the_market_calendar():
     # 21 trading days plus one snapshot on each of the nine closed ones.
     assert actual_15 == 21 * (390 / 15) + 9, actual_15
 
-    # A four-hour interval gets a fraction of a pass per session, and rounding
-    # it up would bring back a smaller version of the same overstatement.
-    assert database._passes_per_month(240) < 21 * 2 + 9
+    # A session starts with a pass at the bell and has one per interval while
+    # it is open, so the count is whole: 09:30 … 15:30 is seven at an hourly
+    # interval, 09:30 and 13:30 are two at four hours. It used to be 6.5 and
+    # 1.625, as if the first pass of a day could land anywhere.
+    assert database._passes_per_month(60) == 21 * 7 + 9
+    assert database._passes_per_month(240) == 21 * 2 + 9
 
     # Never below one pass per trading day, however long the interval.
     assert database._passes_per_month(100_000) == 21 + 9
     print("disk-estimate checks passed")
+
+
+def check_disk_estimate_counts_every_ticker_in_a_pass():
+    """The growth figure must price a whole pass, not one ticker's chain.
+
+    THE DEFECT. Each ticker in a pass is stored under its own `collected_at`,
+    and the estimate divided every stored row by every distinct moment — rows
+    per TICKER per pass, an average chain. On a five-ticker watchlist with SPX
+    in it the caption said 0.1 GB a month for what costs about 1.5. On the
+    data below the old formula answers 164 rows per pass — the average stored
+    chain, a ticker nobody watches any more included; a pass writes 50.
+
+    Own data on an empty database: two tickers collected three times, one
+    watched but never collected, one collected but no longer watched, and runs
+    that must not count — refused ones, and chains older than the ten most
+    recent collections the size is averaged over.
+    """
+    from app import config
+    from app import db as database
+
+    conn = db.get_connection()
+    testdb.truncate_all(conn)
+    for ticker in ("DISKA", "DISKB", "DISKC"):
+        db.add_ticker(conn, ticker)
+    live = (dt.date.today() + dt.timedelta(days=90)).isoformat()
+
+    def chain(rows: int) -> pd.DataFrame:
+        return pd.DataFrame([
+            _chain_row(live, 100.0 + i // 2, "call" if i % 2 == 0 else "put") for i in range(rows)
+        ])
+
+    def collect(ticker: str, moment: datetime, rows: int, store: bool = True) -> None:
+        if store:
+            db.insert_snapshot(conn, ticker, moment, 100.0, chain(rows))
+        db.log_run(conn, moment, moment + dt.timedelta(seconds=5), ticker, "success", rows_fetched=rows)
+
+    first = datetime(2026, 9, 1, 14, 0)
+    # Two old, larger chains of DISKA's, then ten of 40 rows: only the ten count.
+    for k in range(12):
+        moment = first + dt.timedelta(hours=k)
+        collect("DISKA", moment, 400 if k < 2 else 40, store=k >= 9)
+    # Each ticker of a pass gets its own moment, as the collector stores them.
+    for k in range(9, 12):
+        collect("DISKB", first + dt.timedelta(hours=k, seconds=20), 10)
+    # A refused chain is logged with its size and stores nothing.
+    db.log_run(conn, first + dt.timedelta(hours=12), first + dt.timedelta(hours=12, seconds=5),
+               "DISKB", "failed", rows_fetched=5000)
+    # Collected once and then removed from the watchlist: not part of a pass.
+    collect("DISKGONE", first, 1000)
+
+    by_ticker = database.rows_per_pass_by_ticker(conn)
+    assert by_ticker == {"DISKA": 40.0, "DISKB": 10.0, "DISKC": None}, by_ticker
+
+    passes = database._passes_per_month(60)
+    expected = 50 * passes * config.BYTES_PER_SNAPSHOT_ROW / 1_000_000
+    got = database.estimated_growth_mb_per_month(conn, 60)
+    assert abs(got - expected) < 1e-9, (
+        f"{got:.3f} MB a month, not {expected:.3f}: one hourly pass writes 40 + 10 rows "
+        f"for the two watched tickers collected so far"
+    )
+    assert database.estimated_growth_mb_per_month(conn, 60, by_ticker) == got
+    assert database.estimated_growth_mb_per_month(conn, 0) == 0.0
+
+    # Nothing collected at all is zero, which the caption reads as "collect first".
+    testdb.truncate_all(conn)
+    db.add_ticker(conn, "DISKC")
+    assert database.rows_per_pass_by_ticker(conn) == {"DISKC": None}
+    assert database.estimated_growth_mb_per_month(conn, 60) == 0.0
+    testdb.truncate_all(conn)
+    conn.close()
+    print(f"disk estimate counts the whole pass (50 rows, {got:.2f} MB a month hourly)")
 
 
 def check_version_comes_from_the_changelog():
@@ -1046,10 +1133,13 @@ def check_suggestions_name_a_way_forward():
     # 1. The source's own refusal, and it is the ONLY one that blocks: the rest
     # is a reading of what somebody meant, and being wrong about that must cost
     # them a sentence rather than the ability to try.
-    spx = propose("SPX")
-    assert spx.reason == "source" and spx.substitute == "SPY", spx
-    assert spx.blocking, "only the source's refusal takes the button away"
+    spxw = propose("SPXW")
+    assert spxw.reason == "source" and spxw.substitute == "SPX", spxw
+    assert spxw.blocking, "only the source's refusal takes the button away"
     assert not propose("BTCUSD").blocking
+    # SPX itself is collected now, and nothing stands between it and the button.
+    spx = propose("SPX")
+    assert spx is None or not spx.blocking, spx
 
     # 2. No US-listed options at all — and the pair as three terminals write it.
     # One form is stored and the spelling is folded before the lookup, so the
@@ -1195,49 +1285,77 @@ def check_the_collector_knows_about_holidays():
 
 
 def check_symbols_the_source_will_not_serve_are_explained():
-    """SPX is real, and the message about it has to say something true.
+    """Index options are collected under the index's own symbol; what is still
+    refused is refused with something true to say.
 
-    THE FAILURE THIS REPLACES. Yahoo serves no chain and no spot for a
-    cash-settled index, so a watchlist containing SPX collected nothing and the
-    log said "either the symbol does not exist, or the source is limiting
-    requests". The first half is false and the person who typed SPX knows it is
-    false — they trade it — and a message somebody knows to be wrong takes the
-    credibility of every other message with it.
+    THE INDEX HALF. Yahoo serves SPX, XSP, NDX, RUT and DJX chains under the
+    caret (`^SPX`), and serves NONE under the publisher's quote (`^GSPC`,
+    `^DJI`: zero expiries, measured on yfinance 1.7.0) — which is how this
+    product once concluded there were no index options at all, and refused
+    them. One translation, used by every lookup — the chain, the spot, the
+    price history and the has-options check — so that the spot a chain is
+    valued against comes from the same instrument, and so that a lookup added
+    later cannot forget it. DJX in particular must not go to `^DJI`: that is
+    the Dow itself, a hundred times DJX's level.
 
-    THREE PLACES, ONE MAP, and the map belongs to the provider rather than to
-    this module: a licensed feed serves SPX perfectly well, so which symbols are
-    refused is a fact about the source. The three are the refusal when adding,
-    the banner on the ticker's page, and the filter in the collector — checked
-    here through the collector, which is the one with a consequence: every
-    cycle would otherwise spend a request per refused symbol against a source
-    that limits requests, and log a failure against a symbol that is fine.
+    THE REFUSED HALF. VIX, whose options are priced off futures this source
+    does not serve, and the series roots SPXW and NDXP, which are collected
+    inside SPX and NDX — the message for a series root says so instead of
+    claiming the source will not serve it. Checked through the collector too,
+    which is where a refusal has a consequence: every cycle would otherwise
+    spend a request per refused symbol against a source that limits requests.
     """
     from app import collector, providers, suggestions
+    from app.providers import yahoo as yahoo_provider
 
     provider = providers.get_provider()
     refused = provider.unsupported_symbols
-    assert refused["SPX"] == "SPY" and refused["NDX"] == "QQQ", refused
-    # VIX maps to nothing on purpose: an ETF on VIX futures is a different
-    # instrument, and offering it would be worse than offering nothing.
-    assert refused["VIX"] is None, refused
+    for index in ("SPX", "XSP", "NDX", "RUT", "DJX"):
+        assert index not in refused, f"{index} is collected now and must not be refused"
+    assert refused == {"SPXW": "SPX", "NDXP": "NDX", "VIX": None, "VIXW": None}, refused
 
-    message = suggestions.source_refusal("SPX", refused["SPX"], provider.name)
-    assert "real symbol with listed options" in message, message
-    assert "SPY" in message, message
-    # The claim that was false, and the reason this exists.
-    assert "no options" not in message, message
-    no_substitute = suggestions.source_refusal("VIX", None, provider.name)
-    assert "no honest substitute" in no_substitute, no_substitute
-
-    # The other half of the same map: what these instruments are called at
-    # Yahoo, where the index QUOTE exists even though the chain does not. Used
-    # by the price-history lookup behind realized volatility, and by the spot
-    # lookup — one translation, in one place, because a translation applied in
-    # one of two places is the same bug twice.
-    from app.providers import yahoo as yahoo_provider
-    assert yahoo_provider._yahoo_symbol("SPX") == "^GSPC"
-    assert yahoo_provider._yahoo_symbol("spx") == "^GSPC", "the caller's case is not its problem"
+    expected = {"SPX": "^SPX", "XSP": "^XSP", "NDX": "^NDX", "RUT": "^RUT", "DJX": "^DJX"}
+    for ticker, caret in expected.items():
+        assert yahoo_provider._yahoo_symbol(ticker) == caret, ticker
+    assert yahoo_provider._yahoo_symbol("spx") == "^SPX", "the caller's case is not its problem"
     assert yahoo_provider._yahoo_symbol("AAPL") == "AAPL", "anything else is passed through"
+    assert "^GSPC" not in yahoo_provider.INDEX_SYMBOLS.values()
+    assert "^DJI" not in yahoo_provider.INDEX_SYMBOLS.values()
+
+    # Every lookup goes through the translation: the source module's own
+    # yf.Ticker is replaced and asked which symbol it was built with.
+    asked = []
+
+    class FakeTicker:
+        def __init__(self, symbol):
+            asked.append(symbol)
+            self.ticker = symbol
+            self.fast_info = {"lastPrice": 7800.0}
+            self.options = ()
+
+        def history(self, period):
+            return pd.DataFrame({"Close": [1.0, 2.0]})
+
+    real_ticker = yahoo_provider.yf.Ticker
+    yahoo_provider.yf.Ticker = FakeTicker
+    try:
+        source = yahoo_provider.YahooProvider()
+        spot, chain = source.fetch_ticker_snapshot("SPX")
+        assert spot == 7800.0 and chain.empty
+        assert source.fetch_underlying_price("DJX") == 7800.0
+        assert list(source.fetch_price_history("NDX")["close"]) == [1.0, 2.0]
+        assert source.underlying_has_options("RUT") is False
+    finally:
+        yahoo_provider.yf.Ticker = real_ticker
+    assert asked == ["^SPX", "^DJX", "^NDX", "^RUT"], asked
+
+    series = suggestions.source_refusal("SPXW", refused["SPXW"], provider.name)
+    assert "series of SPX options" in series and "**SPX**" in series, series
+    assert "does not serve" not in series, series
+    vix = suggestions.source_refusal("VIX", None, provider.name)
+    assert "real symbol with listed options" in vix and "no honest substitute" in vix, vix
+    assert "priced off VIX futures" in vix, vix
+    assert "no options" not in vix and "does not serve its option chain" not in vix, vix
 
     # A provider written before this attribute existed refuses nothing, rather
     # than crashing every caller that asks.
@@ -1251,7 +1369,7 @@ def check_symbols_the_source_will_not_serve_are_explained():
     # quietly passing on a mocked success.
     class RefusingProvider:
         name = "refusing"
-        unsupported_symbols = {"SPX": "SPY"}
+        unsupported_symbols = {"VIX": None, "SPXW": "SPX"}
 
         def fetch_ticker_snapshot(self, ticker):
             raise AssertionError(f"asked the source for {ticker}, which it refuses")
@@ -1259,14 +1377,14 @@ def check_symbols_the_source_will_not_serve_are_explained():
     conn = db.get_connection()
     try:
         before = len(db.get_recent_runs(conn, limit=200))
-        outcome = collector.collect_watchlist(conn, ["SPX"], provider=RefusingProvider())
-        assert outcome["SPX"].startswith("skipped: "), outcome
-        assert "SPY" in outcome["SPX"], outcome
+        outcome = collector.collect_watchlist(conn, ["VIX", "SPXW"], provider=RefusingProvider())
+        assert outcome["VIX"].startswith("skipped: "), outcome
+        assert outcome["SPXW"].startswith("skipped: ") and "SPX" in outcome["SPXW"], outcome
         assert len(db.get_recent_runs(conn, limit=200)) == before, \
             "a decision not to attempt is not an attempt, and does not belong in the log"
     finally:
         conn.close()
-    print("unsupported-symbol checks passed (three places, one map, no requests)")
+    print("index-symbol checks passed (one translation for every lookup, refusals that say something true)")
 
 
 def check_the_batched_gex_path_returns_the_old_numbers():
@@ -1355,6 +1473,22 @@ def check_the_batched_gex_path_returns_the_old_numbers():
     print("batched GEX checks passed (one matrix, the same numbers)")
 
 
+def _matrix_with_cumulative(cumulative: dict[float, float]) -> pd.DataFrame:
+    """A one-column matrix whose cumulative profile is exactly `cumulative`.
+
+    Written the other way round on purpose: the argument is the shape the
+    flip walks over, so the assertions can be read against it without anyone
+    summing five numbers in their head.
+    """
+    strikes = sorted(cumulative)
+    running = 0.0
+    per_strike = []
+    for strike in strikes:
+        per_strike.append(cumulative[strike] - running)
+        running = cumulative[strike]
+    return pd.DataFrame({pd.Timestamp("2026-09-18"): per_strike}, index=pd.Index(strikes, name="strike"))
+
+
 def check_the_flip_is_the_crossing_by_the_money():
     """The flip must be the zero crossing nearest the underlying price.
 
@@ -1375,21 +1509,7 @@ def check_the_flip_is_the_crossing_by_the_money():
     """
     expiry = pd.Timestamp("2026-09-18")
     spot = 320.0
-
-    def matrix_with(cumulative: dict[float, float]) -> pd.DataFrame:
-        """A one-column matrix whose cumulative profile is exactly `cumulative`.
-
-        Written the other way round on purpose: the argument is the shape the
-        function under test walks over, so the assertions below can be read
-        against it without anyone summing five numbers in their head.
-        """
-        strikes = sorted(cumulative)
-        running = 0.0
-        per_strike = []
-        for strike in strikes:
-            per_strike.append(cumulative[strike] - running)
-            running = cumulative[strike]
-        return pd.DataFrame({expiry: per_strike}, index=pd.Index(strikes, name="strike"))
+    matrix_with = _matrix_with_cumulative
 
     three = matrix_with({130.0: 1.0, 140.0: -1.0, 300.0: -8000.0,
                          310.0: 12000.0, 600.0: 3000.0, 610.0: -500.0})
@@ -1458,6 +1578,244 @@ def check_the_flip_is_the_crossing_by_the_money():
     ), f"the chain-side entry stopped reading the spot off the snapshot: {by_chain} vs {by_hand}"
 
     print("Gamma flip picks the crossing by the money (3 crossings, deep wobble ignored)")
+
+
+def check_a_grazing_crossing_is_not_a_flip():
+    """A crossing counts only between values of significant size.
+
+    Found 12.10.2026 on SPY 2026-09-08 with the spot at 766: the flip came back
+    348.81. Far below the money the cumulative profile wandered between +$0.4K
+    and +$5K, then fell to -$1.5B and stayed negative all the way up — net GEX
+    -0.64B, no regime change anywhere near the price. With no real crossing to
+    prefer, "nearest to the spot" kept the only one there was: a curve grazing
+    zero 418 points below the money. The fix makes a crossing count only when
+    the nearest values on either side larger than GAMMA_FLIP_MIN_SHARE of the
+    profile's peak have opposite signs. Own data: matrices this test builds.
+    """
+    from app import metrics_core as core
+
+    spot = 766.0
+    share = core.GAMMA_FLIP_MIN_SHARE
+
+    # The SPY shape: a positive wobble of a few thousand dollars, then -$1.5B.
+    # Moved up to 640, inside the distance rule's reach (next check), so that
+    # only the size of the wobble can drop it.
+    grazing = _matrix_with_cumulative({600.0: 400.0, 620.0: 5000.0, 640.0: 3000.0, 650.0: -20000.0,
+                                       700.0: -1.5e9, 766.0: -9e8, 800.0: -6.4e8})
+    got = metrics.gamma_flip_from_matrix(grazing, spot)
+    assert got is None, (
+        f"a profile that only grazes zero below the money reported a flip of {got} — "
+        f"about 641.3 means the +$5K wobble against a -$1.5B profile is still read as a regime change"
+    )
+    assert core.gamma_flip_by_depth(grazing, np.ones((1, len(grazing)), dtype=bool), spot) == [None]
+
+    # The same graze at the top end: the profile climbs from -$1.5B to a few
+    # thousand dollars above zero at its last strike. Not a flip either.
+    grazing_up = _matrix_with_cumulative({600.0: -1.5e9, 760.0: -3e8, 900.0: -2000.0, 910.0: 3000.0})
+    assert metrics.gamma_flip_from_matrix(grazing_up, spot) is None
+
+    # A real flip next to the money survives, at exactly the level the old
+    # rule gave it: the interpolation is between the two strikes that bracket
+    # the sign change, whatever the graze below does.
+    real = _matrix_with_cumulative({300.0: 400.0, 320.0: 5000.0, 340.0: 3000.0, 350.0: -20000.0,
+                                    650.0: -1.5e9, 760.0: -2e8, 770.0: 3e8, 800.0: 1e8})
+    got = metrics.gamma_flip_from_matrix(real, spot)
+    assert got is not None and abs(got - 764.0) < 1e-9, f"the flip next to the money moved or vanished: {got}"
+
+    # Where the graze is nearer the spot than the real crossing, the old rule
+    # took the graze; the real one, further away, is the answer now.
+    far_real = _matrix_with_cumulative({480.0: 400.0, 490.0: 5000.0, 500.0: 3000.0, 510.0: -20000.0,
+                                        520.0: -1.5e9, 700.0: -2e8, 710.0: 3e8})
+    got = metrics.gamma_flip_from_matrix(far_real, 600.0)
+    assert got is not None and abs(got - 704.0) < 1e-9, (
+        f"with the spot at 600 the flip came back {got}, not the real crossing at 704.0; "
+        f"about 501.3 means the graze is still preferred for being nearer"
+    )
+
+    # The boundary is the share of the peak: a wobble twice the share is a
+    # crossing, half of it is not. Pins the constant's meaning, not its value.
+    peak = 1.5e9
+    for wobble, kept in ((peak * share * 2, True), (peak * share / 2, False)):
+        edge = _matrix_with_cumulative({300.0: wobble, 350.0: -peak, 800.0: -peak / 2})
+        got = metrics.gamma_flip_from_matrix(edge, 330.0)
+        assert (got is not None) == kept, (wobble / peak, got)
+
+    print(f"Gamma flip ignores a graze of zero (share {share:g} of the profile's peak)")
+
+
+def check_a_far_flip_is_no_flip():
+    """A crossing further than GAMMA_FLIP_MAX_DISTANCE from the price is no flip.
+
+    Owner's decision 12.10.2026, after the graze rule above: with a graze below
+    the money no longer counting, GLD's heatmap flip jumped from 212 to 627
+    against a spot of 378 — a real crossing, 65% away, and no more use to the
+    reader than the graze was. The rule drops the nearest crossing that passes
+    when it lies further than a quarter of the price away, strictly. Own data.
+    """
+    from app import metrics_core as core
+
+    reach = core.GAMMA_FLIP_MAX_DISTANCE
+    spot = 400.0
+    # One real crossing at exactly spot * (1 + offset): the profile is -1e9 one
+    # point below that level and +1e9 one point above, so it crosses midway.
+    for offset, kept in ((reach - 0.01, True), (reach, True), (reach + 0.01, False), (-(reach + 0.01), False)):
+        level = spot * (1 + offset)
+        matrix = _matrix_with_cumulative({level - 1.0: -1e9, level + 1.0: 1e9})
+        got = metrics.gamma_flip_from_matrix(matrix, spot)
+        assert (got is not None) == kept, (
+            f"a crossing {offset:+.0%} from the price came back {got}; "
+            f"the reach is {reach:.0%} and only a flip within it is shown"
+        )
+        assert core.gamma_flip_by_depth(matrix, np.ones((1, 2), dtype=bool), spot) == [got]
+
+    # The rule looks at the nearest crossing that passes, so a far one behind a
+    # near one changes nothing.
+    both = _matrix_with_cumulative({380.0: -1e9, 382.0: 1e9, 640.0: 1e9, 642.0: -1e9})
+    got = metrics.gamma_flip_from_matrix(both, spot)
+    assert got is not None and abs(got - 381.0) < 1e-9, got
+
+    print(f"Gamma flip further than {reach:.0%} from the price is not shown")
+
+
+def check_gamma_flip_by_depth_is_each_crop():
+    """`gamma_flip_by_depth` returns the flip of every leading block of a
+    matrix's columns in one pass; each entry must be `gamma_flip_from_matrix`
+    of that block's crop — the first d columns, the rows the mask marks — to
+    the last bit. A 20-expiry matrix with mixed signs, so the profiles cross
+    zero several times, and masks that grow the way a depth slider's do."""
+    from app import metrics_core as core
+
+    rng = np.random.default_rng(7)
+    strikes = np.arange(80.0, 120.5, 0.5)
+    expiries = list(pd.date_range("2026-10-02", periods=20, freq="7D"))
+    values = rng.normal(0.0, 1e9, size=(len(strikes), len(expiries))) * rng.random((len(strikes), 1))
+    values[rng.random(values.shape) < 0.3] = 0.0
+    matrix = pd.DataFrame(values, index=pd.Index(strikes[::-1], name="strike"), columns=expiries)
+    listed = np.zeros(len(strikes), dtype=bool)
+    masks = []
+    for _ in expiries:
+        listed = listed | (rng.random(len(strikes)) < 0.4)
+        masks.append(listed)
+    spot = 100.3
+    batch = core.gamma_flip_by_depth(matrix, np.array(masks), spot)
+    assert len(batch) == len(expiries)
+    crossings = 0
+    for depth, (mask, flip) in enumerate(zip(masks, batch), start=1):
+        one = metrics.gamma_flip_from_matrix(matrix.loc[mask, expiries[:depth]], spot)
+        assert flip == one, (depth, flip, one)
+        crossings += flip is not None
+    assert crossings >= len(expiries) // 2, "the fixture must cross zero at most depths"
+    assert core.gamma_flip_by_depth(matrix, np.array(masks), float("nan")) == [None] * len(expiries)
+    assert core.gamma_flip_by_depth(matrix.iloc[:0], np.zeros((3, 0), dtype=bool), spot) == [None] * 3
+    print(f"Gamma flip by depth: {len(expiries)} depths equal their crops")
+
+
+def check_normal_kernels_are_scipys():
+    """The core evaluates the normal CDF with `scipy.special.ndtr` and the
+    density with scipy's own expression instead of `scipy.stats.norm`, whose
+    argument checks cost more than the kernel. Every greek and every solved
+    volatility rests on these two, so they must be scipy's answers to the bit —
+    across the range, NaN, ±inf and ±0 included — and of the same type for a
+    scalar, an array and a Series."""
+    from app import metrics_core as core
+
+    grid = np.concatenate([np.linspace(-40.0, 40.0, 40001),
+                           [np.nan, np.inf, -np.inf, 0.0, -0.0, 1e-300, -1e-300]])
+    for ours, theirs in ((core._norm_cdf, norm.cdf), (core._norm_pdf, norm.pdf)):
+        assert np.array_equal(ours(grid), theirs(grid), equal_nan=True), ours.__name__
+        series = pd.Series(grid[::97])
+        got, expected = ours(series), theirs(series)
+        assert type(got) is type(expected) and np.array_equal(got, expected, equal_nan=True), ours.__name__
+        for scalar in (0.3, -2.5):
+            got, expected = ours(scalar), theirs(scalar)
+            assert type(got) is type(expected) and got == expected, (ours.__name__, scalar, got, expected)
+    print("Normal CDF and density: scipy's values and types, bit for bit")
+
+
+def check_expiry_moment_cache_changes_nothing():
+    """`_expiry_moment` is memoised — a chain maps every row through it, with a
+    few dozen distinct expiries across ten thousand rows — and the memo must be
+    invisible: the same instant for every input shape callers pass, on the
+    first call and on a repeated one, and an input that raises must keep
+    raising rather than being remembered.
+
+    THE MEMO IS KEYED BY THE CALENDAR DATE, not by the caller's value. Two
+    tz-aware timestamps of one instant are equal and hash alike while naming
+    different dates — 23:30 in New York is 03:30 the next day in UTC — and a
+    memo keyed by the value answered the second with the first one's close: a
+    time to expiry a day off, depending only on which was asked first.
+
+    A MISSING EXPIRY HAS NO MOMENT. None, NaN and NaT give NaT, so the time
+    left is NaN like any other missing input. They used to place the close in
+    year 1 and price the contract as expired two thousand years ago.
+    """
+    from app import metrics_core as core
+
+    def compute(expiry):
+        return core._close_of.__wrapped__(pd.Timestamp(expiry).date())
+
+    for expiry in (pd.Timestamp("2026-10-02").date(), pd.Timestamp("2026-12-18"), "2027-01-15"):
+        for _ in range(2):
+            assert core._expiry_moment(expiry) == compute(expiry), expiry
+    as_of = pd.Timestamp("2026-09-29 14:30")
+    chain = pd.Series([pd.Timestamp("2026-10-02"), pd.Timestamp("2026-12-18")] * 500)
+    years = core.years_to_expiry_series(chain, as_of)
+    expected = [(compute(e) - as_of).total_seconds() / core._YEAR_SECONDS for e in chain]
+    assert list(years) == expected
+    for _ in range(2):
+        try:
+            core._expiry_moment("not a date")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a bad expiry must keep raising, not be remembered")
+
+    late_ny = pd.Timestamp("2026-10-16 23:30", tz="America/New_York")
+    same_utc = pd.Timestamp("2026-10-17 03:30", tz="UTC")
+    for pair in ((late_ny, same_utc), (same_utc, late_ny)):
+        core._close_of.cache_clear()
+        got = {str(stamp): core._expiry_moment(stamp) for stamp in pair}
+        assert got == {
+            str(late_ny): pd.Timestamp("2026-10-16 20:00"),
+            str(same_utc): pd.Timestamp("2026-10-17 20:00"),
+        }, f"one instant, two dates, each its own close: {got}"
+    for missing in (None, float("nan"), pd.NaT):
+        assert core._expiry_moment(missing) is pd.NaT, missing
+        assert pd.isna(core.years_to_expiry(missing, as_of)), missing
+    print("Expiry moment cache: same instants, bad input still raises, tz-aware and missing expiries")
+
+
+def check_expiry_moments_are_the_row_map():
+    """`_expiry_moments` evaluates the 16:00 New York close once per distinct
+    expiry instead of once per row; the rows must get exactly what the row map
+    gives — values, index, dtype — for every shape callers pass, and an
+    unreadable expiry must still raise."""
+    from app import metrics_core as core
+
+    def row_map(expiry):
+        return pd.to_datetime(pd.Series(expiry).map(core._expiry_moment))
+
+    shapes = [
+        pd.Series(pd.to_datetime(["2026-10-02", "2026-12-18", "2026-10-02"] * 50), index=range(10, 160)),
+        pd.Series(pd.to_datetime(["2026-10-02", "2026-11-20"]).astype("datetime64[s]")),
+        pd.Series(["2026-10-02", "2027-01-15", "2026-10-02"]),
+        pd.Series([dt.date(2026, 10, 2), dt.date(2026, 3, 20)]),
+        pd.Series([], dtype="datetime64[s]"),
+        # A missing expiry has no moment (NaT), exactly as the row map says.
+        pd.Series([pd.Timestamp("2026-10-02"), pd.NaT]),
+    ]
+    for shape in shapes:
+        got, expected = core._expiry_moments(shape), row_map(shape)
+        assert got.dtype == expected.dtype, (shape.dtype, got.dtype, expected.dtype)
+        assert got.index.equals(expected.index)
+        assert got.equals(expected), (shape.tolist()[:3], got.tolist()[:3], expected.tolist()[:3])
+    try:
+        core._expiry_moments(pd.Series(["2026-10-02", "not a date"]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unreadable expiry must raise, as the row map does")
+    print("Expiry moments per distinct expiry: same values, index and dtype as the row map")
 
 
 def check_the_strike_count_actually_decides_what_is_drawn():
@@ -1700,6 +2058,73 @@ def check_a_stopped_collection_does_not_look_healthy():
     print("freshness checks passed (resting, stale, failing, and the bell-minute trap)")
 
 
+def check_a_closed_market_is_not_a_failure():
+    """The zero-open-interest refusal on a closed market is an outcome, not a
+    failure — and nothing else is excused.
+
+    Outside regular hours Yahoo serves chains with open interest zeroed on most
+    contracts, and the guard rightly refuses them. The worker takes one
+    snapshot on each closed day, so Saturday, Sunday and Monday before the open
+    made three refusals in a row — the threshold at which every screen says
+    "Collection for this symbol is failing", for every symbol, about a market
+    that was shut. Classified on read, so the rows already in a run log come
+    out right too: the legacy wording is in this fixture alongside the new one.
+    """
+    from app import collector, config, freshness
+
+    conn = db.get_connection()
+    ticker = "CLOSEDCHK"
+    friday = dt.datetime(2026, 9, 11, 19, 45)  # 15:45 New York
+    legacy = (
+        "93% of contracts have open_interest=0 (threshold 50%) — either the data source returned "
+        "a corrupted/incomplete snapshot, or the market is closed right now; not saving."
+    )
+    current = str(collector.ZeroOpenInterestChain(0.93, market_closed=True))
+
+    def run(status, at, message=None, who=ticker):
+        db.log_run(conn, at, at + dt.timedelta(seconds=20), who, status, message, source="yahoo")
+
+    run("success", friday)
+    run("failed", dt.datetime(2026, 9, 12, 4, 14), legacy)   # Saturday 00:14 New York
+    run("failed", dt.datetime(2026, 9, 13, 4, 14), current)  # Sunday
+    run("failed", dt.datetime(2026, 9, 14, 4, 14), current)  # Monday, before the open
+    assert db.collection_state(conn, ticker) == (friday, 0)
+    monday_morning = dt.datetime(2026, 9, 14, 12, 0, tzinfo=dt.timezone.utc)  # 08:00 New York
+    verdict = freshness.assess(friday, 0, 15, now=monday_morning)
+    assert verdict is not None and verdict[0] == freshness.RESTING, verdict
+
+    # The same refusal inside the session is a failure, and so is anything
+    # else on a closed day: being limited by the source on a Saturday is real.
+    run("failed", dt.datetime(2026, 9, 12, 16, 0), "the data source is limiting requests")
+    run("failed", dt.datetime(2026, 9, 14, 14, 0), current)  # Monday 10:00 New York
+    run("failed", dt.datetime(2026, 9, 14, 14, 15), "no price for CLOSEDCHK")
+    assert db.collection_state(conn, ticker) == (friday, 3)
+    later = dt.datetime(2026, 9, 14, 14, 20, tzinfo=dt.timezone.utc)
+    assert freshness.assess(friday, 3, 15, now=later)[0] == freshness.FAILING
+
+    # A holiday is closed by the calendar, not by the weekday: Labor Day noon.
+    assert db.is_closed_market_refusal(dt.datetime(2026, 9, 7, 16, 0), current)
+    assert not db.is_closed_market_refusal(dt.datetime(2026, 9, 8, 16, 0), current)
+    assert not db.is_closed_market_refusal(dt.datetime(2026, 9, 7, 16, 0), "no price for X")
+
+    # Suspension reads the same rule: a symbol whose chain keeps arriving
+    # zeroed over a long weekend exists, and is not tidied away.
+    fresh = "NEWCLOSED"
+    for night in range(config.UNRESOLVABLE_AFTER_FAILURES + 2):
+        run("failed", dt.datetime(2026, 9, 5, 4, 14) + dt.timedelta(days=night), current, who=fresh)
+    assert fresh not in db.unresolvable_tickers(conn)
+    for minute in range(config.UNRESOLVABLE_AFTER_FAILURES):
+        run("failed", dt.datetime(2026, 9, 15, 15, minute), "no price for NEWCLOSED", who=fresh)
+    assert db.unresolvable_tickers(conn).get(fresh) == dt.datetime(
+        2026, 9, 15, 15, config.UNRESOLVABLE_AFTER_FAILURES - 1
+    )
+
+    conn.execute("DELETE FROM collection_runs WHERE ticker IN (%s, %s)", (ticker, fresh))
+    conn.commit()
+    conn.close()
+    print("closed-market checks passed (the weekend is quiet, a session failure still counts)")
+
+
 def check_the_run_log_answers_how_collection_is_going():
     """Last success and failures SINCE it, read in one query and per source.
 
@@ -1869,6 +2294,47 @@ def _day_chain(moment: dt.datetime, spot: float, expiry: dt.date, oi_scale: floa
     return pd.DataFrame(rows)
 
 
+def check_every_weather_state_has_its_picture():
+    """Each of the five states draws its own glyph on the hosted product's
+    48-unit grid, with the colours saying what the state says: a green sun
+    wherever hedging still damps, a purple bolt or rain wherever it amplifies,
+    and both at once only where the price sits on the flip."""
+    from app import theme, weather
+
+    states = (metrics.WEATHER_CLEAR, metrics.WEATHER_FAIR, metrics.WEATHER_UNSETTLED,
+              metrics.WEATHER_RAIN, metrics.WEATHER_STORM)
+    pictures = set()
+    for state in states:
+        reading = {
+            "state": state, "net_gex": 1.0, "gamma_flip": 100.0, "underlying_price": 101.0,
+            "flip_distance_pct": 1.0, "collected_at": "2026-09-09 19:42",
+        }
+        html = weather.panel(reading)
+        assert '<svg width="48" height="48" viewBox="0 0 48 48"' in html, state
+        art = weather._ART[state]
+        pictures.add(art)
+        sunny = state in (metrics.WEATHER_CLEAR, metrics.WEATHER_FAIR, metrics.WEATHER_UNSETTLED)
+        wet = state in (metrics.WEATHER_UNSETTLED, metrics.WEATHER_RAIN, metrics.WEATHER_STORM)
+        assert (theme.ACCENT in art) == sunny, state
+        assert (theme.PRIMARY in art) == wet, state
+        # A sun is a disc with rays, not a dot: the rays are what Unsettled lost.
+        assert not sunny or art.count("<line") >= 3, state
+    assert len(pictures) == len(states)
+
+    # No flip means none within the core's reach, not none in the strike
+    # range: a real crossing further away is dropped too, and the sentence
+    # has to say what was actually looked at.
+    from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
+
+    flipless = {"state": metrics.WEATHER_STORM, "net_gex": -1.0, "gamma_flip": None,
+                "underlying_price": 101.0, "collected_at": "2026-09-09 19:42"}
+    sentence = weather.describe(flipless)["sentence"]
+    assert f"no gamma flip within {GAMMA_FLIP_MAX_DISTANCE:.0%} of the price" in sentence, sentence
+    assert "strike range" not in sentence, sentence
+
+    print("weather glyph checks passed (five states, five pictures, colours by regime)")
+
+
 def check_the_day_row_and_the_ladder():
     """A day row from a chain, and what two of them say happened.
 
@@ -1996,6 +2462,105 @@ def check_the_day_row_and_the_ladder():
     print("day-row and ladder checks passed (the day rule, one expiry, the first day, the regime)")
 
 
+def check_a_day_is_a_session_that_opened():
+    """One rule for every reader of a day: a collection counts as its day only
+    once that day's session had opened.
+
+    The worker takes one snapshot on a closed day — a weekend, a holiday, and
+    just after midnight on any day — and each of those used to become a day of
+    its own: Changes compared Saturday with Sunday, Labor Day sat in the
+    history as a trading day, and before the open OI Delta compared last
+    night's chain with yesterday's and read zero everywhere. All on September
+    2026's real calendar (Labor Day is Monday the 7th), stated in UTC.
+
+    Then the rows an older build already wrote: every reader must ignore them,
+    and the cleanup must remove exactly those, report the same count dry, and
+    find nothing the second time.
+    """
+    from app import day_summary
+    from app import market_calendar as mc
+
+    friday = dt.datetime(2026, 9, 4, 19, 45)        # 15:45 New York
+    saturday = dt.datetime(2026, 9, 5, 16, 0)       # weekend
+    sunday = dt.datetime(2026, 9, 6, 16, 0)         # weekend
+    labor_day = dt.datetime(2026, 9, 7, 4, 26)      # 00:26 New York, a holiday
+    tuesday_night = dt.datetime(2026, 9, 8, 4, 14)  # 00:14 New York, before the open
+    tuesday = dt.datetime(2026, 9, 8, 19, 45)
+    wednesday_night = dt.datetime(2026, 9, 9, 4, 14)  # the day's only collection
+    thursday = dt.datetime(2026, 9, 10, 19, 45)
+    late_friday = dt.datetime(2026, 9, 12, 1, 15)   # Friday 21:15 New York: Friday's, after the close
+
+    assert mc._exchange_calendar() is not None, "the checks run with the exchange calendar installed"
+    opened = {friday, tuesday, thursday, late_friday}
+    for moment in (friday, saturday, sunday, labor_day, tuesday_night, tuesday,
+                   wednesday_night, thursday, late_friday):
+        assert mc.session_started(moment) == (moment in opened), moment
+        assert day_summary.is_session_snapshot(moment) == (moment in opened), moment
+    # A half-day counts from its open, and after its 13:00 close it still counts.
+    assert mc.session_started(dt.datetime(2026, 11, 27, 19, 0))
+    assert not mc.session_started(dt.datetime(2026, 11, 26, 19, 0)), "Thanksgiving"
+    # And "the last completed trading day" agrees: on the Tuesday after Labor
+    # Day it is Friday, or the volume baseline built through Friday looks stale
+    # and is rebuilt on every pass of the day.
+    assert mc.last_completed_trading_day(tuesday) == dt.date(2026, 9, 4)
+    assert mc.last_completed_trading_day(thursday) == dt.date(2026, 9, 9)
+
+    # The row itself: a closed day makes none, whatever the chain looks like.
+    expiry = _future_friday()
+    for moment in (saturday, labor_day, tuesday_night):
+        chain = _day_chain(moment, 100.0, expiry)
+        assert day_summary.summarize(chain, metrics.DEFAULT_PRICING, metrics.gamma_weather(chain)) is None, moment
+
+    conn = db.get_connection()
+    ticker, source = "SESSCHK", "yahoo"
+
+    # The per-day moment list behind OI Delta and the volume baseline.
+    for moment in (friday, saturday, labor_day, tuesday_night, tuesday, wednesday_night):
+        db.log_run(conn, moment, moment + dt.timedelta(seconds=20), ticker, "success",
+                   rows_fetched=10, source=source)
+    per_day = db.get_collection_moments(conn, ticker, days=None, per_day=True, source=source)
+    assert per_day == [tuesday, friday], per_day
+
+    # Rows an older build wrote: built for a real session, then filed the way
+    # the old rule filed them.
+    def stale(day, at):
+        chain = _day_chain(friday, 100.0, expiry)
+        row = day_summary.summarize(chain, metrics.DEFAULT_PRICING, metrics.gamma_weather(chain))
+        row.update(day=day, collected_at=at)
+        db.upsert_day_summary(conn, ticker, source, row, day_summary.CODE_SHA)
+
+    stale(dt.date(2026, 9, 4), friday)
+    stale(dt.date(2026, 9, 5), saturday)
+    stale(dt.date(2026, 9, 6), sunday)
+    stale(dt.date(2026, 9, 7), labor_day)
+    stale(dt.date(2026, 9, 9), wednesday_night)
+    stale(dt.date(2026, 9, 10), thursday)
+    stale(dt.date(2026, 9, 12), late_friday)  # filed under the UTC date: a Saturday
+
+    assert db.list_day_summaries(conn, ticker, source) == [dt.date(2026, 9, 10), dt.date(2026, 9, 4)]
+    assert db.get_day_summary(conn, ticker, source)["day"] == dt.date(2026, 9, 10)
+    assert db.get_day_summary(conn, ticker, source, dt.date(2026, 9, 5)) is None
+    assert db.previous_day_summary(conn, ticker, source, dt.date(2026, 9, 10))["day"] == dt.date(2026, 9, 4)
+
+    # Tuesday has a session collection and no row; the closed days are not offered.
+    assert db.missing_day_summaries(conn, ticker, source, 100000, day_summary.CODE_SHA) == [tuesday]
+
+    assert db.drop_non_session_day_summaries(conn, [ticker], dry_run=True) == 5
+    assert conn.execute("SELECT count(*) FROM ticker_day_summary WHERE ticker = %s", (ticker,)).fetchone()[0] == 7
+    assert db.drop_non_session_day_summaries(conn, [ticker]) == 5
+    assert db.drop_non_session_day_summaries(conn, [ticker]) == 0, "a second run must find nothing"
+    left = conn.execute(
+        "SELECT day FROM ticker_day_summary WHERE ticker = %s ORDER BY day DESC", (ticker,)
+    ).fetchall()
+    assert [r[0] for r in left] == [dt.date(2026, 9, 10), dt.date(2026, 9, 4)], left
+
+    conn.execute("DELETE FROM ticker_day_summary WHERE ticker = %s", (ticker,))
+    conn.execute("DELETE FROM collection_runs WHERE ticker = %s", (ticker,))
+    conn.commit()
+    conn.close()
+    print("session-day checks passed (weekend, holiday, before the open, stale rows and their cleanup)")
+
+
 def check_day_summaries_are_written_and_filled_in():
     """The rows reach the database, and the gaps fill themselves in.
 
@@ -2050,10 +2615,18 @@ def check_day_summaries_are_written_and_filled_in():
     # Now the real path: snapshots plus a run log, and the backfill reading
     # them. A day nothing was collected on simply has no row to build.
     backfill_ticker = "DAYFILL"
-    today = dt.datetime.utcnow().replace(microsecond=0)
-    at = today - dt.timedelta(days=1)
-    while at.isoweekday() > 5:
-        at -= dt.timedelta(days=1)
+    # A moment inside the last full session, found with the calendar: a day
+    # only counts once its session has opened, so "yesterday at this hour"
+    # would be a holiday on some days and before the open at some hours.
+    from app import market_calendar
+
+    day = dt.date.today() - dt.timedelta(days=1)
+    while market_calendar.session_times(day)[0] is None:
+        day -= dt.timedelta(days=1)
+    at = (
+        dt.datetime.combine(day, dt.time(15, 0), tzinfo=market_calendar.MARKET_TZ)
+        .astimezone(dt.timezone.utc).replace(tzinfo=None)
+    )
     chain = _day_chain(at, 100.0, expiry)
     db.insert_snapshot(
         conn, backfill_ticker, at, 100.0,
@@ -2266,6 +2839,8 @@ def main():
     testdb.truncate_all(reset)
     reset.close()
 
+    # First, and empty again when it returns: it owns the whole watchlist.
+    check_disk_estimate_counts_every_ticker_in_a_pass()
     check_timezone_database_is_available()
     check_years_to_expiry()
     check_greeks_respond_to_time()
@@ -2299,12 +2874,21 @@ def main():
     check_provider_gamma_is_preferred()
     check_cboe_reads_the_morning_bites_raw_instead_of_requesting()
     check_the_collector_stores_a_source_moment_once()
+    check_a_grazing_crossing_is_not_a_flip()
+    check_a_far_flip_is_no_flip()
+    check_gamma_flip_by_depth_is_each_crop()
+    check_normal_kernels_are_scipys()
+    check_expiry_moment_cache_changes_nothing()
+    check_expiry_moments_are_the_row_map()
     check_the_strike_count_actually_decides_what_is_drawn()
     check_the_solver_stands_aside_where_it_should()
     check_a_stopped_collection_does_not_look_healthy()
     check_the_run_log_answers_how_collection_is_going()
+    check_a_closed_market_is_not_a_failure()
     check_realized_volatility_is_stored_once_a_day_and_read_back()
+    check_every_weather_state_has_its_picture()
     check_the_day_row_and_the_ladder()
+    check_a_day_is_a_session_that_opened()
     check_day_summaries_are_written_and_filled_in()
     print("\nALL UNIT CHECKS PASSED")
 

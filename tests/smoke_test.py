@@ -91,6 +91,15 @@ def check_scheduled_collection(conn):
         assert stored == minutes, f"{label} ({minutes}) came back as {stored}"
 
     assert db.estimated_growth_mb_per_month(conn, 0) == 0.0, "off costs nothing"
+    # The chain size comes from the collection log, and this fixture stored its
+    # chains without logging a successful run: log one, as the collector would,
+    # of the size of TEST's latest stored chain.
+    latest, rows = conn.execute(
+        """SELECT collected_at, count(*) FROM option_snapshots WHERE ticker = 'TEST'
+           GROUP BY collected_at ORDER BY collected_at DESC LIMIT 1"""
+    ).fetchone()
+    db.log_run(conn, latest, latest, "TEST", "success", rows_fetched=rows)
+    assert db.rows_per_pass_by_ticker(conn) == {"TEST": float(rows)}
     hourly = db.estimated_growth_mb_per_month(conn, 60)
     quarter_hourly = db.estimated_growth_mb_per_month(conn, 15)
     assert quarter_hourly > hourly > 0, (hourly, quarter_hourly)
@@ -371,16 +380,19 @@ def check_narrow_reads_and_rollups(conn):
     assert len(moments) == 5, moments
     assert moments == sorted(moments, reverse=True), "newest first, as the Replay list expects"
 
-    # HOW MANY DAILY BUCKETS THE FIXTURE HAS DEPENDS ON THE WEEKDAY, and saying
+    # HOW MANY DAILY BUCKETS THE FIXTURE HAS DEPENDS ON THE CLOCK, and saying
     # so out loud is the fix rather than the problem. The last moment carries
-    # today's calendar date: on a weekday that is a fourth trading day, on a
-    # weekend it is a copy of Friday that the per-day grouping drops on purpose
-    # (see the SQL in db.get_collection_moments). Both are right, and a check
-    # that assumed one of them was red on `main` from a Sunday until a Monday
-    # fixed it without anybody touching the code.
+    # today's calendar date at 14:00 UTC: on a session day after its open that
+    # is a fourth trading day; on a weekend, a holiday, or a winter morning
+    # when 14:00 UTC is 09:00 in New York, it is a collection from before the
+    # session that the per-day rule drops on purpose (see
+    # db.get_collection_moments). Both are right, and a check that assumed one
+    # of them was red on `main` from a Sunday until a Monday fixed it without
+    # anybody touching the code. So the check asks the rule rather than
+    # restating it.
     per_day = db.get_collection_moments(conn, ticker, days=None, per_day=True)
-    today_is_a_trading_day = dt_date.today().isoweekday() <= 5
-    assert len(per_day) == (4 if today_is_a_trading_day else 3), per_day
+    today_counts = market_calendar.session_started(plan[-1][0])
+    assert len(per_day) == (4 if today_counts else 3), per_day
     assert per_day[-2] == plan[2][0], "a day collected twice must be represented by its later pass"
 
     latest = db.get_latest_snapshot(conn, ticker)

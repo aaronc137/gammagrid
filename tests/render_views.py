@@ -225,6 +225,70 @@ def empty_database():
     finally:
         conn.close()
 
+def expanders(block) -> int:
+    """How many expanders a part of the page drew, at any depth."""
+    children = getattr(block, "children", None) or {}
+    return sum((child.type == "expander") + expanders(child) for child in children.values())
+
+def guide_links(block, lesson: str) -> list[bool]:
+    """Every element linking to `lesson`, as whether the element right after it
+    in the same block is an expander — the explanation it belongs on."""
+    found = []
+    children = getattr(block, "children", None) or {}
+    items = [children[key] for key in sorted(children)]
+    for index, child in enumerate(items):
+        if child.type == "markdown" and f'href="{lesson}"' in (child.value or ""):
+            after = items[index + 1] if index + 1 < len(items) else None
+            found.append(after is not None and after.type == "expander")
+        found.extend(guide_links(child, lesson))
+    return found
+
+def check_every_view_links_its_lesson() -> list[str]:
+    """Each view's first explanation is `howto(<that view>)`, which puts the
+    view's lesson in the Guide on its label — read from the source, so that a
+    view whose explanation only appears with enough data is held to it too.
+
+    A view counts the explanations of the functions it calls (the Contract
+    view's lives in the contract card it shares with the Screener)."""
+    from app import guide
+
+    with open(DASHBOARD) as handle:
+        tree = ast.parse(handle.read())
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+
+    def explanations(node, seen=frozenset()):
+        """The expanders a piece of the page opens, in source order: the view
+        named by `howto("...")`, or None for a bare `st.expander(...)`."""
+        found = []
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            name = sub.func.attr if isinstance(sub.func, ast.Attribute) else getattr(sub.func, "id", None)
+            if name == "howto" and sub.args and isinstance(sub.args[0], ast.Constant):
+                found.append((sub.lineno, sub.args[0].value))
+            elif name == "expander":
+                found.append((sub.lineno, None))
+            elif name in functions and name not in seen:
+                found.extend(
+                    (sub.lineno, view) for _, view in explanations(functions[name], seen | {name})
+                )
+        return sorted(found, key=lambda item: item[0])
+
+    problems = []
+    for node in tree.body:
+        if not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "active_view"):
+            continue
+        view = node.test.comparators[0].value
+        opened = [label for _, label in explanations(node)]
+        if view not in guide.VIEW_LESSONS:
+            problems.append(f"view {view!r} has no lesson in app/guide.py")
+        elif not opened or opened[0] != view:
+            problems.append(f"view {view!r}: its first explanation is not howto({view!r}) (found {opened[:1]})")
+    return problems
+
 def main():
     problems = check_no_cross_view_names()
     if problems:
@@ -233,6 +297,14 @@ def main():
             print(f"  - {line}")
         raise SystemExit(1)
     print("Cross-view name check passed (no view depends on another's locals)")
+
+    problems = check_every_view_links_its_lesson()
+    if problems:
+        print("GUIDE LINK CHECK FAILED:")
+        for line in problems:
+            print(f"  - {line}")
+        raise SystemExit(1)
+    print("Guide link check passed (every view's first explanation carries its lesson)")
 
     from streamlit.testing.v1 import AppTest
 
@@ -259,7 +331,7 @@ def main():
         # green, because with UTC the wrong key happened to equal the right one.
         from zoneinfo import ZoneInfo
 
-        from app import collector, db, viewtime
+        from app import collector, db, guide, viewtime
         viewtime.viewer_timezone = lambda: ZoneInfo("Europe/Prague")
 
         collector.fetch_price_history = lambda ticker, period="6mo": pd.DataFrame(
@@ -291,8 +363,24 @@ def main():
             if drawn < 3:
                 failures.append(f"{view}: rendered only {drawn} element(s)")
                 print(f"  {view:<18} EMPTY ({drawn})")
+                continue
+
+            # Where the view drew its first explanation, the lesson link is the
+            # element right before it — that is what places it on the block's
+            # label (app/guide.py says why not inside it). The check above
+            # already holds every view to having one, including the two whose
+            # explanation waits for data this fixture does not have.
+            lesson = guide.url(guide.VIEW_LESSONS[view][0])
+            links = guide_links(app.main, lesson)
+            explained = expanders(app.main) > 0
+            if links and not all(links):
+                failures.append(f"{view}: the link to {lesson} is not on an explanation block")
+                print(f"  {view:<18} GUIDE LINK ADRIFT")
+            elif explained and not links:
+                failures.append(f"{view}: explained, but no link to {lesson}")
+                print(f"  {view:<18} NO GUIDE LINK")
             else:
-                print(f"  {view:<18} ok ({drawn} elements)")
+                print(f"  {view:<18} ok ({drawn} elements{', guide link' if links else ''})")
 
     if failures:
         print("\nRENDER CHECKS FAILED:")
