@@ -85,8 +85,9 @@ def _tidy(text: str) -> str:
     """译文排版统一(三个译者的半角 / 全角习惯不同): 挨着汉字的半角标点换全角并吃掉
     其后的空格, 一对括号有一边成了全角另一边跟着换。数字、时间、网址、代码两边都
     不是汉字, 不受影响。"""
-    text = re.sub(rf"(?<=[{_CJK}])({_HALF}) ?", lambda m: m.group(1).translate(_FULLWIDTH), text)
-    text = re.sub(rf"({_HALF}) ?(?=[{_CJK}])", lambda m: m.group(1).translate(_FULLWIDTH), text)
+    for _ in range(2):  # 第二遍: 括号刚换成全角, 紧跟它的半角标点这时才认得出
+        text = re.sub(rf"(?<=[{_CJK}])({_HALF}) ?", lambda m: m.group(1).translate(_FULLWIDTH), text)
+        text = re.sub(rf"({_HALF}) ?(?=[{_CJK}])", lambda m: m.group(1).translate(_FULLWIDTH), text)
     text = re.sub(r"(?<=[，；：。、！？]) +", "", text)
     text = re.sub(rf"(?<=[{_CJK}，。；：）])\n[ \t]*(?=[{_CJK}（])", "", text)  # 源码里折行, 渲染成空格
     text = re.sub(r" *—— *", "——", text)
