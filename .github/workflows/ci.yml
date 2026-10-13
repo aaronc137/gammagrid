@@ -61,5 +61,9 @@ jobs:
       - name: Render every view
         run: python tests/render_views.py
 
+      # morning-bites: 中文界面不许漏翻(app/zh.py); 合并上游后漏的新句子在这里变红
+      - name: Chinese UI
+        run: python tests/zh_check.py
+
       - name: Docker build
         run: docker build -t gammagrid .

@@ -28,6 +28,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     suggestions,
     theme,
     weather,
+    zh,
 )
 from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
 from app.viewtime import (
@@ -52,6 +53,8 @@ FAVICON = (
 )
 
 st.set_page_config(page_title="GammaGrid", page_icon=FAVICON, layout="wide")
+zh.install()  # morning-bites: 中文界面, 显示时翻译(app/zh.py)
+zh.toggle()
 
 st.markdown(theme.stylesheet(), unsafe_allow_html=True)
 
@@ -114,7 +117,7 @@ def howto(view: str, title: str = "ℹ️ How to read this", expanded: bool = Fa
     """A view's first explanation block, with its lesson in the Guide on the
     right of the label (app/guide.py). Used as `with howto("Overview"):`."""
     st.markdown(guide.link(view), unsafe_allow_html=True)
-    return st.expander(title, expanded=expanded)
+    return zh.after(st.expander(title, expanded=expanded), view)  # morning-bites: 中文补充说明
 
 
 def render_option_detail(
@@ -993,6 +996,7 @@ def get_tracked() -> pd.DataFrame:
 _weather = metrics.gamma_weather(latest_df)
 if _weather:
     st.markdown(weather.panel(_weather, latest_moment=latest_date), unsafe_allow_html=True)
+    zh.note("weather")  # morning-bites: 天气卡片的读法
 
 VIEWS = [
     "Overview", "Changes", "Max Pain / GEX", "GEX Heatmap", "Volatility (IV)",
