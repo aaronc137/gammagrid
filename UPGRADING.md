@@ -39,6 +39,53 @@ touched by the move and is still the backup for those versions.)*
 | **One-way** | The database is changed in a way an older version does not understand. Going back needs the backup. Your collected rows are still there and still correct. |
 | **Destructive** | Something is rewritten or removed. Back up first, read the entry in full. **No release has been in this category, and the project's first rule is that collected data is never deleted** — if one ever appears here, it will say exactly what goes. |
 
+## v0.7.0 → v0.8.0
+
+**Risk: safe. No migration; nothing in the database is rewritten or deleted.**
+
+**What you may notice on the first run.**
+
+- **`yfinance` is pinned to exactly 1.7.0.** It used to be `>=0.2.40`, which
+  let the same commit collect differently depending on the day the image was
+  built. `docker compose up --build` installs the pinned version on its own.
+  Running from source, run `pip install -r requirements.txt` again — an older
+  yfinance left in your environment is not what this release was checked
+  against.
+- **The worker rebuilds the Changes rows once.** Each row records which
+  version of the formulas produced it, and this release changes the
+  calculation code (for speed — every number comes out identical). Rows built
+  by the older code are rebuilt from the stored snapshots at the worker's next
+  start, up to 45 days back, exactly as on the upgrade to v0.7.0 — at under
+  half of that release's cost per ticker-day.
+- **Changes may offer fewer days than before.** A day now counts only once
+  its session has opened (weekends, exchange holidays and the snapshot the
+  collector takes overnight before the open are not days), and the rows an
+  older version wrote for such days are skipped when read — nothing is
+  deleted by the upgrade itself, and going back to v0.7.0 shows them again.
+  To remove them from the table as well, look first, then delete:
+
+  ```bash
+  docker compose run --rm --no-deps worker \
+      python -m app.day_summary --drop-non-session-days --dry-run
+  docker compose run --rm --no-deps worker \
+      python -m app.day_summary --drop-non-session-days
+  ```
+
+  It removes only day-summary rows — never a collected snapshot, which is what
+  they are rebuilt from — and running it a second time finds nothing.
+  `--ticker SPY` narrows it to one symbol.
+- **SPX, XSP, NDX, RUT and DJX can be added.** Nothing already collected is
+  touched. If an earlier version refused one of them, add it again; the ETF it
+  suggested (SPY, QQQ, IWM, DIA) keeps its own history and can stay. SPX is a
+  large chain — about 18,000 contracts and some 20 seconds per collection —
+  so every pass with it in the watchlist takes that much longer and stores
+  roughly twice what SPY does.
+- **Fewer failures are counted.** The collection log is not rewritten:
+  runs refused because the market was closed stay `failed` with their reason,
+  and are simply no longer counted towards the "collection is failing" note
+  or towards suspending a symbol. If a symbol is currently suspended only
+  because of overnight refusals, it is retried on the next pass.
+
 ## v0.6.1 → v0.7.0
 
 **Risk: safe. Two additive migrations, nothing rewritten and nothing deleted.**

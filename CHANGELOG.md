@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-12
+
+### Added
+- **Index options: SPX, XSP, NDX, RUT and DJX now collect.** Add them under
+  their own names. Since 0.6.0 they were refused with an ETF offered instead,
+  on the finding that Yahoo has no chain for a cash-settled index — which was
+  true of the symbol that was checked, `^GSPC`, and false of the index's own
+  Cboe symbol: under `^SPX`, `^XSP`, `^NDX`, `^RUT` and `^DJX` Yahoo serves 53,
+  42, 40, 28 and 12 expiries, dailies included. The chain and the spot price
+  now come from that one symbol, so they arrive delayed alike. SPX is the
+  largest chain the product collects: 17,774 contracts fetched in 20 seconds
+  here, and its heatmap and day row build in 28 and 38 ms. Fixed on the way:
+  DJX's price lookup used the Dow itself, a hundred times DJX's level.
+  Typing the series roots SPXW or NDXP now points to SPX or NDX, whose chains
+  carry them. VIX is still not collected — its options are priced off VIX
+  futures, which this source does not serve. One limit of the source, written
+  down in the README: on the third Friday of the month Yahoo serves one
+  contract per strike, the monthly AM-settled SPX where it is listed, so that
+  day's SPXW chain is incomplete.
+- **Every view's "How to read this" links its lesson in the Guide.** The
+  right end of the block's label reads "Guide · lesson N →" and opens the
+  lesson of the public Guide at gammagrid.io that explains that view — the
+  put/call ratio for Overview, the GEX heatmap for GEX Heatmap, and so on,
+  the same lesson the hosted version links. The sidebar links the Guide's
+  contents page. They are plain links: no tracking parameters, nothing
+  counted, nothing sent anywhere until you follow one.
+
 ### Changed
 - **The interface now reads the same as the hosted version.** Same palette,
   same three corner radii, same type scale — and, the change you notice first,
@@ -25,6 +52,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   — 450 pixels and an outside request — to show the underlying's price on
   screens that are about the option chain. It now sits at the foot of
   Overview, under "Underlying price", where the hosted version keeps it.
+- **The GEX heatmap and the day rows behind Changes are built about three
+  times faster**, with the same numbers to the last bit. On a stored SPY chain
+  of 8,762 contracts the heatmap went from 68 ms to 19 ms and a day row from
+  60 ms to 26 ms. Two things were repeated for answers already known: the
+  16:00 New York close of each expiry was worked out once per contract rather
+  than once per expiry, and the normal distribution was evaluated through a
+  wrapper whose argument checks cost more than the arithmetic. The shared
+  calculation core is back in step with the hosted version's, including two
+  edge cases in the time to expiry that nothing this application stores can
+  reach, fixed anyway because the core is a library: an expiry with no date
+  now gives no time to expiry instead of one two thousand years in the past,
+  and two time-zone-aware expiries naming one instant on different dates are
+  no longer given the same close.
+- **`yfinance` is pinned to 1.7.0** instead of "0.2.40 or anything newer".
+  It is an unofficial wrapper around a website, and a new release can change
+  what a chain comes back as; with an open range the same commit collected
+  differently depending on the day its image was built.
+
+### Fixed
+- **"About X GB per month" now prices a whole collection pass.** Every
+  ticker in a pass is stored under its own moment, and the estimate divided
+  all stored rows by all moments — the size of one average chain, not of a
+  pass over the watchlist — so it came out low by about the number of
+  tickers: 0.1 GB a month at hourly for five tickers including SPX, which
+  cost about 1.6. It now adds up each watched ticker's chain, averaged over
+  its last ten successful collections in the collection log; a ticker not
+  collected yet is named under the figure as not counted. Two inputs were
+  corrected on the way. A row costs 285 bytes with its indexes, measured on
+  this product's own tables (the figure was 214, taken from the hosted
+  product). And a session gets a whole number of passes, since the collector
+  always takes the first one at the opening bell: seven at hourly, not 6.5,
+  and two at four hours, not 1.6. On the install this was measured on, one
+  pass of the five tickers wrote 35,879 rows, 10.2 MB; the new figure is
+  1.7 GB a month at hourly, against 0.1 before.
+- **A curve that only grazes zero is no longer reported as the gamma flip,
+  and neither is a crossing more than 25% from the price.** Far from the
+  money the cumulative GEX profile can wander a few thousand dollars either
+  side of zero while the profile near the price is a billion or more of one
+  sign, and when nothing else crossed, "the crossing nearest the price" was
+  that graze: SPY with the price at 766 showed a flip of 348.81. A crossing
+  now counts only when the profile reaches a meaningful size on both sides of
+  it (more than one ten-thousandth of its largest value), and the nearest one
+  that counts is still dropped when it lies more than 25% from the price —
+  with a graze below no longer counting, the next real crossing can be on the
+  far side of the money, and a level that far away says no more about the
+  regime than the graze did. A flip that passes both rules keeps exactly the
+  level it had. The weather card without a flip now says "no gamma flip
+  within 25% of the price" instead of "inside its strike range", which was
+  no longer what it meant, and the heatmap's "How to read this" explains
+  both rules. The formulas are the hosted product's, byte for byte
+  (`app/metrics_core.py`, sha256 `de8bc89c…`); day rows written by the
+  previous formulas are rebuilt by the worker on its next daily pass, as
+  far back as `DAY_SUMMARY_BACKFILL_DAYS` reaches (45 days by default).
+- **The gamma-weather glyphs are the hosted version's again.** Unsettled was
+  drawn as a green dot beside a cloud and a bolt, where the hosted product
+  draws a sun with rays behind the cloud — both regimes visibly in play — and
+  Fair had lost one of its rays. All five states now use the same art, on the
+  same grid, as the hosted product's summary strip and share card.
+- **Changes no longer reads like graph paper.** Its table had a box drawn
+  around every cell, on top of the page's background grid, so every number
+  sat in a cage of lines from two sources. The table now has rules between
+  rows only, and the background grid is drawn at the strength the hosted
+  version uses — the grid colour mixed with the page background — which
+  quiets it under every view, not just this one.
+- **Changes, OI Delta and the Unusual Activity baseline no longer count a day
+  the market did not trade.** With the market closed the collector takes one
+  snapshot a day as a safety net — on weekends, on exchange holidays, and just
+  after midnight New York on any day — and each of those became a day of its
+  own: Changes could compare Saturday with Sunday and present the source's
+  weekend re-pricing as a day's change, Labor Day sat in the history as a
+  trading day, and before the opening bell OI Delta compared last night's
+  snapshot with yesterday's and read zero on every row, because open interest
+  is not refreshed overnight. There is now one rule for all of them: a day
+  counts once its session has opened, by the exchange calendar — so on a
+  Monday the day before is Friday, and before 09:30 New York "today" is still
+  the last session. Rows an older version already wrote for such days are
+  ignored everywhere; `python -m app.day_summary --drop-non-session-days`
+  removes them from the database if you want the table to say the same (see
+  UPGRADING.md).
+- **"Collection for this symbol is failing" no longer appears after a
+  weekend or a holiday.** Outside regular hours Yahoo serves chains with open
+  interest zeroed on most contracts, and the quality check rightly refuses to
+  store them — but each refusal counted as a failure, and the one snapshot the
+  collector takes on each closed day made three in a row by Monday morning:
+  the banner, on every symbol at once, about a market that was shut. Such a
+  refusal is now reported as the market being closed: it is still in the
+  collection log with its reason, but it neither counts towards the banner nor
+  towards suspending a symbol. The same refusal during a session, and any
+  other error on any day, still counts. Runs already in your log are read the
+  same way — on the log collected while writing this, 44 of 57 recorded
+  failures were this.
 
 ## [0.7.0] - 2026-09-19
 
@@ -691,7 +809,9 @@ Initial public release — see the [Roadmap](ROADMAP.md) for what's next.
 - Docker / Docker Compose quick start; GammaGrid brand theme (`.streamlit/config.toml`)
 - AGPL-3.0 license
 
-[Unreleased]: https://github.com/gammagrid/gammagrid/compare/v0.6.1...main
+[Unreleased]: https://github.com/gammagrid/gammagrid/compare/v0.8.0...main
+[0.8.0]: https://github.com/gammagrid/gammagrid/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/gammagrid/gammagrid/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/gammagrid/gammagrid/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gammagrid/gammagrid/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/gammagrid/gammagrid/compare/v0.5.1...v0.5.2

@@ -33,12 +33,13 @@ THE RULES.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
-from scipy.stats import norm
+from scipy.special import ndtr
 
 from app import config
 
@@ -220,11 +221,34 @@ EXPIRY_TZ = ZoneInfo("America/New_York")
 _YEAR_SECONDS = 365 * 24 * 3600
 
 
-def _expiry_moment(expiry) -> pd.Timestamp:
-    """The instant a contract actually stops trading, as naive UTC."""
-    date = pd.Timestamp(expiry).date()
+@functools.lru_cache(maxsize=4096)
+def _close_of(date: dt.date) -> pd.Timestamp:
+    """16:00 New York on `date`, as naive UTC.
+
+    Memoised because the callers map every row of a chain through it, and a
+    chain of ten thousand rows carries only a few dozen distinct expiries: the
+    timezone arithmetic below was a quarter of a cold GEX heatmap build,
+    repeated for answers already known. Keyed by the calendar date, not by the
+    caller's value: two tz-aware timestamps of the same instant in different
+    zones are equal and hash alike, yet name different calendar dates, so a
+    cache keyed by the timestamp answered the second with the first one's
+    close — a day off, depending on call order."""
     local = dt.datetime.combine(date, EXPIRY_CLOSE_ET, tzinfo=EXPIRY_TZ)
     return pd.Timestamp(local.astimezone(dt.timezone.utc)).tz_localize(None)
+
+
+def _expiry_moment(expiry) -> pd.Timestamp:
+    """The instant a contract actually stops trading, as naive UTC.
+
+    The date is read in the expiry's own zone. A missing expiry (None, NaN,
+    NaT) has no moment and gives NaT, so the time left is NaN like any other
+    missing input — `NaT.date()` does not raise, and combining it with New
+    York used to place the close in year 1 and price the contract as long
+    expired."""
+    stamp = pd.Timestamp(expiry)
+    if pd.isna(stamp):
+        return pd.NaT
+    return _close_of(stamp.date())
 
 
 def _as_naive_utc(moment) -> pd.Timestamp:
@@ -252,9 +276,20 @@ def years_to_expiry(expiry, as_of) -> float:
     return (_expiry_moment(expiry) - _as_naive_utc(as_of)).total_seconds() / _YEAR_SECONDS
 
 
+def _expiry_moments(expiry) -> pd.Series:
+    """`_expiry_moment` for every row, computed once per distinct expiry:
+    the same values, index and dtype as a row-by-row map."""
+    series = pd.Series(expiry)
+    if series.empty:
+        return pd.to_datetime(series.map(_expiry_moment))
+    codes, distinct = pd.factorize(series, use_na_sentinel=False)
+    moments = pd.to_datetime(pd.Series([_expiry_moment(value) for value in distinct]))
+    return pd.Series(moments.to_numpy()[codes], index=series.index)
+
+
 def years_to_expiry_series(expiry: pd.Series, as_of) -> pd.Series:
     """Vectorized counterpart — the screener and GEX price whole chains."""
-    moments = pd.to_datetime(pd.Series(expiry).map(_expiry_moment))
+    moments = _expiry_moments(expiry)
     return (moments - _as_naive_utc(as_of)).dt.total_seconds() / _YEAR_SECONDS
 
 
@@ -351,6 +386,21 @@ def merge_provider_greeks(computed: pd.DataFrame, snapshot: pd.DataFrame) -> pd.
     return merged
 
 
+
+_SQRT_2PI = np.sqrt(2 * np.pi)
+
+
+def _norm_cdf(x):
+    """Standard normal CDF — scipy's own kernel, without the distribution
+    object's argument checks around it, which cost more than the kernel."""
+    return ndtr(np.asarray(x, dtype=float))
+
+
+def _norm_pdf(x):
+    """Standard normal density, the expression scipy evaluates."""
+    return np.exp(-np.asarray(x, dtype=float) ** 2 / 2.0) / _SQRT_2PI
+
+
 def _black_scholes_greeks(
     spot: float, strike: float, years_to_expiry: float, iv: float, risk_free_rate: float,
     option_type: str, dividend_yield: float = 0.0,
@@ -403,7 +453,7 @@ def _black_scholes_greeks(
     sqrt_t = np.sqrt(years_to_expiry)
     d1 = (np.log(spot / strike) + (risk_free_rate - q + iv ** 2 / 2) * years_to_expiry) / (iv * sqrt_t)
     d2 = d1 - iv * sqrt_t
-    pdf_d1 = norm.pdf(d1)
+    pdf_d1 = _norm_pdf(d1)
     discount = np.exp(-risk_free_rate * years_to_expiry)
     carry_discount = np.exp(-q * years_to_expiry)
 
@@ -415,23 +465,23 @@ def _black_scholes_greeks(
     ) / (2 * years_to_expiry * iv * sqrt_t)
 
     if option_type == "call":
-        delta = carry_discount * norm.cdf(d1)
+        delta = carry_discount * _norm_cdf(d1)
         theta = (
             -(spot * carry_discount * pdf_d1 * iv) / (2 * sqrt_t)
-            - risk_free_rate * strike * discount * norm.cdf(d2)
-            + q * spot * carry_discount * norm.cdf(d1)
+            - risk_free_rate * strike * discount * _norm_cdf(d2)
+            + q * spot * carry_discount * _norm_cdf(d1)
         ) / 365
-        rho = strike * years_to_expiry * discount * norm.cdf(d2) / 100
-        charm = q * carry_discount * norm.cdf(d1) - shared_charm
+        rho = strike * years_to_expiry * discount * _norm_cdf(d2) / 100
+        charm = q * carry_discount * _norm_cdf(d1) - shared_charm
     else:
-        delta = carry_discount * (norm.cdf(d1) - 1)
+        delta = carry_discount * (_norm_cdf(d1) - 1)
         theta = (
             -(spot * carry_discount * pdf_d1 * iv) / (2 * sqrt_t)
-            + risk_free_rate * strike * discount * norm.cdf(-d2)
-            - q * spot * carry_discount * norm.cdf(-d1)
+            + risk_free_rate * strike * discount * _norm_cdf(-d2)
+            - q * spot * carry_discount * _norm_cdf(-d1)
         ) / 365
-        rho = -strike * years_to_expiry * discount * norm.cdf(-d2) / 100
-        charm = -q * carry_discount * norm.cdf(-d1) - shared_charm
+        rho = -strike * years_to_expiry * discount * _norm_cdf(-d2) / 100
+        charm = -q * carry_discount * _norm_cdf(-d1) - shared_charm
 
     return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "rho": rho, "vanna": vanna, "charm": charm}
 
@@ -509,8 +559,8 @@ def _black_scholes_greeks_batch(
     the point is that all greeks in the app share one model."""
     # EVERY NUMERIC INPUT IS COERCED FIRST, and this is not belt-and-braces: a
     # column that is entirely NULL in the database comes back as dtype `object`,
-    # and object arithmetic here produces an object `d1` that scipy's `norm.pdf`
-    # rejects with an unreadable message about `isnan` and casting rules. The
+    # and object arithmetic here produces object arrays that fail further down
+    # with an unreadable message about `isnan` and casting rules. The
     # caller cannot always know — the value may have travelled through a
     # `where` that quietly changed its dtype — so the function that needs floats
     # is the one that insists on them.
@@ -530,7 +580,7 @@ def _black_scholes_greeks_batch(
     sqrt_t = np.sqrt(safe_t)
     d1 = (np.log(safe_spot / strike) + (rate - q + safe_iv ** 2 / 2) * safe_t) / (safe_iv * sqrt_t)
     d2 = d1 - safe_iv * sqrt_t
-    pdf_d1 = norm.pdf(d1)
+    pdf_d1 = _norm_pdf(d1)
     discount = np.exp(-rate * safe_t)
     carry_discount = np.exp(-q * safe_t)
 
@@ -542,28 +592,28 @@ def _black_scholes_greeks_batch(
     ) / (2 * safe_t * safe_iv * sqrt_t)
 
     is_call = (option_type == "call").to_numpy()
-    delta = np.where(is_call, carry_discount * norm.cdf(d1), carry_discount * (norm.cdf(d1) - 1))
+    delta = np.where(is_call, carry_discount * _norm_cdf(d1), carry_discount * (_norm_cdf(d1) - 1))
     theta = np.where(
         is_call,
         (-(safe_spot * carry_discount * pdf_d1 * safe_iv) / (2 * sqrt_t)
-         - rate * strike * discount * norm.cdf(d2)
-         + q * safe_spot * carry_discount * norm.cdf(d1)) / 365,
+         - rate * strike * discount * _norm_cdf(d2)
+         + q * safe_spot * carry_discount * _norm_cdf(d1)) / 365,
         (-(safe_spot * carry_discount * pdf_d1 * safe_iv) / (2 * sqrt_t)
-         + rate * strike * discount * norm.cdf(-d2)
-         - q * safe_spot * carry_discount * norm.cdf(-d1)) / 365,
+         + rate * strike * discount * _norm_cdf(-d2)
+         - q * safe_spot * carry_discount * _norm_cdf(-d1)) / 365,
     )
     rho = np.where(
         is_call,
-        strike * safe_t * discount * norm.cdf(d2) / 100,
-        -strike * safe_t * discount * norm.cdf(-d2) / 100,
+        strike * safe_t * discount * _norm_cdf(d2) / 100,
+        -strike * safe_t * discount * _norm_cdf(-d2) / 100,
     )
     # With q != 0 charm no longer coincides for calls and puts (see the scalar
     # version) — it must be split here too, or the screener and the Contract
     # tab would disagree on the same contract.
     charm = np.where(
         is_call,
-        q * carry_discount * norm.cdf(d1) - shared_charm,
-        -q * carry_discount * norm.cdf(-d1) - shared_charm,
+        q * carry_discount * _norm_cdf(d1) - shared_charm,
+        -q * carry_discount * _norm_cdf(-d1) - shared_charm,
     )
 
     result = pd.DataFrame(
@@ -622,8 +672,8 @@ def _bs_price(spot, strike, years, sigma, rate, is_call, dividend_yield):
     discount = np.exp(-rate * years)
     return np.where(
         is_call,
-        spot * carry * norm.cdf(d1) - strike * discount * norm.cdf(d2),
-        strike * discount * norm.cdf(-d2) - spot * carry * norm.cdf(-d1),
+        spot * carry * _norm_cdf(d1) - strike * discount * _norm_cdf(d2),
+        strike * discount * _norm_cdf(-d2) - spot * carry * _norm_cdf(-d1),
     )
 
 
@@ -701,7 +751,7 @@ def solve_implied_volatility(
             modelled = _bs_price(spot, strike, years, sigma, rate, is_call, dividend_yield)
             sqrt_t = np.sqrt(years)
             d1 = (np.log(spot / strike) + (rate - dividend_yield + 0.5 * sigma**2) * years) / (sigma * sqrt_t)
-            vega = spot * carry * norm.pdf(d1) * sqrt_t
+            vega = spot * carry * _norm_pdf(d1) * sqrt_t
             step = np.where(vega > _IV_MIN_VEGA, (modelled - price) / vega, 0.0)
             # The step is clipped as well as the result: an unclipped Newton
             # step on a near-flat vega jumps far outside the bracket and the
@@ -749,7 +799,7 @@ def solve_implied_volatility(
         d1_final = (
             np.log(spot / strike) + (rate - dividend_yield + 0.5 * sigma**2) * years
         ) / (sigma * sqrt_t)
-        vega_final = spot * carry * norm.pdf(d1_final) * sqrt_t
+        vega_final = spot * carry * _norm_pdf(d1_final) * sqrt_t
         determined = vega_final >= tolerance / _IV_RESOLUTION
         solved = solvable & (final <= tolerance) & determined
     result[solved] = sigma[solved]
@@ -845,7 +895,7 @@ def with_solved_iv(
     # `collected_at` on every row, and passing the column to it raises. Built
     # the same way it builds — expiry mapped to its 16:00 New York close — so
     # the two cannot drift apart on the definition of "time to expiry".
-    expiry_moments = pd.to_datetime(pd.Series(frame["expiry"]).map(_expiry_moment))
+    expiry_moments = _expiry_moments(frame["expiry"])
     collected = pd.to_datetime(frame["collected_at"])
     years = (expiry_moments - collected).dt.total_seconds() / _YEAR_SECONDS
     price = contract_price_for_iv(frame)
@@ -870,7 +920,7 @@ def with_solved_iv(
     # the database as dtype `object`, not float. `Series.where` takes its dtype
     # from `other`, so falling back to it turned the WHOLE column to object even
     # when a single row fell back, and the greeks batch downstream then built an
-    # object array that `norm.pdf` cannot take:
+    # object array that the normal density could not take:
     #
     #     TypeError: ufunc 'isnan' not supported for the input types
     #
@@ -968,15 +1018,17 @@ def _contract_gex(frame: pd.DataFrame, pricing: PricingInputs) -> pd.Series:
     span many moments (`net_gex_series` passes exactly such a frame). For a
     single-moment frame that reduces to the scalar the profile uses.
 
-    Sign convention, unchanged: puts contribute negatively — the "dealers are
-    net long puts / net short calls versus retail flow" heuristic, which does
-    NOT reflect actual market-maker positioning.
+    Sign convention, unchanged: calls contribute positively, puts negatively.
+    That encodes the usual assumption that dealers are long the calls investors
+    sell against stock they hold and short the puts investors buy for
+    protection — a heuristic about who holds which side, which does NOT reflect
+    actual market-maker positioning.
     """
     spot = pd.to_numeric(frame["underlying_price"], errors="coerce")
     collected = pd.to_datetime(frame["collected_at"])
     # Per row, the same way `years_to_expiry` builds it — expiry mapped to its
     # 16:00 New York close.
-    expiry_moments = pd.to_datetime(pd.Series(frame["expiry"]).map(_expiry_moment))
+    expiry_moments = _expiry_moments(frame["expiry"])
     years = (expiry_moments - collected).dt.total_seconds() / _YEAR_SECONDS
     greeks = _black_scholes_greeks_batch(
         spot, pd.to_numeric(frame["strike"], errors="coerce"), years,
@@ -1001,8 +1053,9 @@ def gamma_exposure_profile(
     """Approximate dealer GEX profile by strike for the given expiry (spec FR6).
     `as_of=None` — the latest snapshot (current state); otherwise a specific
     collection date from history (Replay, spec section 12, GEX Heatmap). Sign
-    convention: puts contribute negatively — the "dealers are net long puts /
-    net short calls versus retail flow" heuristic, which does NOT reflect
+    convention: calls contribute positively, puts negatively — the assumption
+    that dealers are long the calls investors sell against stock and short the
+    puts investors buy for protection. A heuristic, which does NOT reflect
     actual market-maker positioning (see the disclaimer in the UI)."""
     snapshot_date = as_of if as_of is not None else df["collected_at"].max()
     snapshot = df[(df["collected_at"] == snapshot_date) & (df["expiry"] == expiry)].copy()
@@ -1124,9 +1177,11 @@ def net_gex_series(df: pd.DataFrame, pricing: PricingInputs = DEFAULT_PRICING) -
     already held to agree to 1e-9 by tests/smoke_test.py, so "same number" is
     asserted rather than assumed.
 
-    Sign convention, unchanged: puts contribute negatively — the "dealers are
-    net long puts / net short calls versus retail flow" heuristic, which does
-    NOT reflect actual market-maker positioning.
+    Sign convention, unchanged: calls contribute positively, puts negatively.
+    That encodes the usual assumption that dealers are long the calls investors
+    sell against stock they hold and short the puts investors buy for
+    protection — a heuristic about who holds which side, which does NOT reflect
+    actual market-maker positioning.
     """
     columns = ["collected_at", "expiry", "net_gex"]
     if df is None or df.empty:
@@ -1237,6 +1292,16 @@ def dealer_walls(
     return {"call_wall": wall("call"), "put_wall": wall("put")}
 
 
+# Smallest share of the cumulative profile's largest absolute value that a
+# value on each side of a zero crossing must exceed for the crossing to count
+# as the gamma flip — see `gamma_flip_from_matrix`.
+GAMMA_FLIP_MIN_SHARE = 1e-4
+
+# Furthest the flip may lie from the underlying price, as a share of it; a
+# crossing further away is reported as no flip — see `gamma_flip_from_matrix`.
+GAMMA_FLIP_MAX_DISTANCE = 0.25
+
+
 def gamma_flip_price(
     df: pd.DataFrame,
     as_of: pd.Timestamp | None = None,
@@ -1288,7 +1353,7 @@ def gamma_flip_from_matrix(matrix: pd.DataFrame, spot: float) -> float | None:
     an edge: GLD had eleven, the first at 232.11 against a spot of 408.89; SPY
     reported 496.33 against 769.74.
 
-    Two rules, and both are needed — each leaves a real chain wrong on its own.
+    Four rules, and all are needed — each leaves a real chain wrong without it.
 
     A CROSSING IS A CHANGE BETWEEN A STRICTLY POSITIVE AND A STRICTLY NEGATIVE
     TOTAL, so strikes carrying no exposure at all take no part. `np.sign` maps
@@ -1310,7 +1375,50 @@ def gamma_flip_from_matrix(matrix: pd.DataFrame, spot: float) -> float | None:
     it differs from this one in 3 of those 200 snapshots, and in all three it
     was the further of the two from the money (GLD 424.13 against 421.37 with
     the spot at 421.37). It is also the rule that fails the same way the old one
-    did, only upwards, as soon as a chain carries junk above the money."""
+    did, only upwards, as soon as a chain carries junk above the money.
+
+    A CROSSING HAS TO SEPARATE TWO SIGNIFICANT VALUES, and the nearest-crossing
+    rule needs this third one beneath it: when the profile never changes sign
+    anywhere near the money, the nearest crossing left is the noise far below
+    it. SPY with the spot at 766 reported a flip of 348.81: the cumulative sum
+    there wandered between +$0.4K and +$5K while the profile reached -$1.5B and
+    stayed negative all the way up — a curve grazing zero, not changing regime.
+    So a value takes part only once its magnitude exceeds
+    `GAMMA_FLIP_MIN_SHARE` of the profile's largest absolute value, and a
+    crossing counts when the nearest such values on either side of it have
+    opposite signs. Where it counts, the level is still interpolated between
+    the two strikes that bracket the actual sign change, so a crossing that
+    passes keeps exactly the level it had. One that does not pass is the same
+    answer as no sign change at all: no flip level in this range. The share is
+    relative because GEX has no natural unit across tickers. A window around
+    the spot was the other candidate and is the wrong instrument: it measures
+    distance, not size, so it would keep a graze that happens to lie near the
+    money and drop a genuine flip on a name that moves ten percent a week.
+    On daily profiles every graze measured did lie far away, but per expiry
+    some sit within 1-4% of the spot: an expiry hours from its close, whose
+    gamma off the money is at machine zero, or a dip of 2e-5 of the profile
+    between two positive values — exactly the cases a window would keep.
+    The share's value comes from the gap between the two populations on 209
+    daily profiles of eleven tickers: the grazing crossings peak at 1.8e-5 of
+    the profile, all of them 38-76% away from the spot, and the next crossing
+    up reaches 3.6e-4. Every share from 3e-5 to 3e-4 drops the same fifteen and
+    moves no other flip; 1e-4 sits in the middle of that range on a log scale,
+    a factor of five from the noise and three and a half from the weakest
+    crossing kept.
+
+    A FLIP MORE THAN `GAMMA_FLIP_MAX_DISTANCE` FROM THE PRICE IS NO FLIP. The
+    size rule keeps a real crossing wherever it is, and the next real one can
+    lie on the far side of the money: GLD with the spot at 378 had its flip
+    jump from 212 to 627 once a graze below stopped counting. A level 65% away
+    does not answer "how far is the regime change from here" any better than
+    the graze did, so the nearest crossing that passes is still dropped when it
+    lies further than a quarter of the price away. A quarter because the
+    question is about moves the shown expiries can plausibly see: it is about
+    one and a half monthly standard deviations for the most volatile chain
+    collected (implied volatility near 57%), seven for an index at 13%. A
+    tighter cut starts removing levels a volatile name does reach within the
+    month; on 594 daily snapshots it drops 11 of 484 weather flips (2.3%), the
+    furthest 42% away."""
     if matrix.empty:
         return None
 
@@ -1322,25 +1430,70 @@ def gamma_flip_from_matrix(matrix: pd.DataFrame, spot: float) -> float | None:
     if not np.isfinite(reference):
         return None
 
-    combined = matrix.sum(axis=1).sort_index()
-    cumulative = combined.cumsum()
-    strikes = cumulative.index.to_numpy(dtype=float)
-    values = cumulative.to_numpy(dtype=float)
+    ordered = matrix.sort_index()
+    totals = _running_totals(ordered.to_numpy(dtype=float))[:, -1]
+    return _nearest_crossing(ordered.index.to_numpy(dtype=float), totals, reference)
 
-    carrying = np.flatnonzero(values)
-    level = None
-    distance = None
-    for lower, upper in zip(carrying[:-1], carrying[1:]):
-        if np.sign(values[lower]) == np.sign(values[upper]):
-            continue
-        x0, x1 = strikes[lower], strikes[upper]
-        y0, y1 = values[lower], values[upper]
-        # y0 and y1 are nonzero with opposite signs, so they cannot be equal
-        # and the interpolation cannot divide by zero.
-        crossing = float(x0 + (0 - y0) * (x1 - x0) / (y1 - y0))
-        if distance is None or abs(crossing - reference) < distance:
-            level, distance = crossing, abs(crossing - reference)
-    return level
+
+def gamma_flip_by_depth(matrix: pd.DataFrame, listed: np.ndarray, spot: float) -> list[float | None]:
+    """The flip of every leading block of the matrix's columns, in one pass.
+
+    Entry d is `gamma_flip_from_matrix` of the first d + 1 columns cropped to
+    the rows `listed[d]` marks (a boolean mask over `matrix.index`), exactly."""
+    listed = np.asarray(listed, dtype=bool)
+    reference = pd.to_numeric(spot, errors="coerce")
+    if matrix.empty or not np.isfinite(reference):
+        return [None] * len(listed)
+    order = np.argsort(matrix.index.to_numpy(dtype=float), kind="stable")
+    strikes = matrix.index.to_numpy(dtype=float)[order]
+    running = _running_totals(matrix.to_numpy(dtype=float)[order])
+    return [
+        _nearest_crossing(strikes[rows], running[rows, depth], reference)
+        for depth, rows in enumerate(mask[order] for mask in listed)
+    ]
+
+
+def _running_totals(values: np.ndarray) -> np.ndarray:
+    """Row totals accumulated left to right, NaN as zero: column k is the
+    total of the first k + 1 columns. A fixed order, so the flip does not
+    depend on how a frame happens to be laid out in memory."""
+    return np.cumsum(np.where(np.isnan(values), 0.0, values), axis=1)
+
+
+def _nearest_crossing(strikes: np.ndarray, totals: np.ndarray, reference: float) -> float | None:
+    """Crossings of the cumulative profile between strictly signed values,
+    interpolated linearly; of those whose nearest significant values on either
+    side differ in sign, the one nearest the reference, the first on a tie —
+    or None if even that one is further from it than `GAMMA_FLIP_MAX_DISTANCE`."""
+    cumulative = np.cumsum(totals)
+    carrying = np.flatnonzero(cumulative)
+    if len(carrying) < 2:
+        return None
+    before, after = carrying[:-1], carrying[1:]
+    y0, y1 = cumulative[before], cumulative[after]
+    change = np.sign(y0) != np.sign(y1)
+    # Indices of the values large enough to take part (`gamma_flip_from_matrix`,
+    # third rule). At least one exists: the largest value exceeds any share of
+    # itself below one, since `carrying` is not empty.
+    magnitude = np.abs(cumulative)
+    significant = np.flatnonzero(magnitude > GAMMA_FLIP_MIN_SHARE * magnitude.max())
+    left = np.searchsorted(significant, before, side="right") - 1
+    right = np.searchsorted(significant, after, side="left")
+    bracketed = (left >= 0) & (right < len(significant))
+    left_sign = np.sign(cumulative[significant[np.clip(left, 0, len(significant) - 1)]])
+    right_sign = np.sign(cumulative[significant[np.clip(right, 0, len(significant) - 1)]])
+    change &= bracketed & (left_sign != right_sign)
+    if not change.any():
+        return None
+    x0, x1 = strikes[before][change], strikes[after][change]
+    y0, y1 = y0[change], y1[change]
+    # y0 and y1 are nonzero with opposite signs, so they cannot be equal and
+    # the interpolation cannot divide by zero.
+    crossings = x0 + (0 - y0) * (x1 - x0) / (y1 - y0)
+    nearest = crossings[np.argmin(np.abs(crossings - reference))]
+    if abs(nearest - reference) > GAMMA_FLIP_MAX_DISTANCE * abs(reference):
+        return None
+    return float(nearest)
 
 
 _CONTRACT_KEYS = ["expiry", "strike", "option_type"]

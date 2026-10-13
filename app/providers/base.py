@@ -111,10 +111,11 @@ class DataProvider(Protocol):
     # tradeable substitute — or to None when there is no honest one.
     #
     # A PROPERTY OF THE PROVIDER, not of the market, and that distinction is
-    # the reason this lives here rather than in a module-level map. SPX is a
-    # real, heavily traded, cash-settled index option; Yahoo simply has no
-    # chain endpoint for it, and a licensed feed serves it without complaint.
-    # Nothing about the symbol says which — only the source does.
+    # the reason this lives here rather than in a module-level map. VIX options
+    # are real and heavily traded; Yahoo lists them, but priced off VIX futures
+    # they need a futures curve this source does not serve, while another feed
+    # might carry one. Nothing about the symbol says which — only the source
+    # does.
     #
     # Read through `getattr` everywhere it is used, so a provider written
     # before this attribute existed is still a valid provider and reads as

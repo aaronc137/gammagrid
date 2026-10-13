@@ -273,6 +273,13 @@ def suggest(ticker: str, known: list[str] | set[str] | None = None) -> str | Non
     return matches[0] if matches and matches[0] != candidate else None
 
 
+# Option series that trade under a root of their own — SPX weeklies and NDX's
+# PM-settled contracts — mapped to the index whose chain carries them. Typing
+# the root is asking for the index, and a refusal that read "not served" would
+# be false about a chain that is collected in full.
+SERIES_ROOTS = {"SPXW": "SPX", "NDXP": "NDX"}
+
+
 def source_refusal(ticker: str, substitute: str | None, provider: str = "the current data source") -> str:
     """What to say about a symbol the data source will not serve.
 
@@ -281,22 +288,34 @@ def source_refusal(ticker: str, substitute: str | None, provider: str = "the cur
     limitation is ours.
 
     THE SUBSTITUTE IS PASSED IN RATHER THAN LOOKED UP HERE. Which symbols a
-    source refuses is a fact about the SOURCE — a licensed feed serves SPX,
-    Yahoo has no endpoint for it at all — so the provider carries the map
+    source refuses is a fact about the SOURCE — Yahoo lists a VIX chain this
+    product will not model, a futures-aware feed could — so the provider carries the map
     (`unsupported_symbols`) for the same reason it carries its own interval
     floor. Keeping it here would mean this module had to know which provider is
     active, and that is exactly the shape worth avoiding.
     """
     candidate = (ticker or "").strip().upper()
-    head = (
-        f"“{candidate}” is a real symbol with listed options, but {provider} "
-        "does not serve its option chain, so there would be nothing to collect."
-    )
+    if substitute and candidate in SERIES_ROOTS and SERIES_ROOTS[candidate] == substitute:
+        return (
+            f"“{candidate}” is a series of {substitute} options rather than an underlying: "
+            f"{provider} serves those contracts inside the {substitute} chain. Add "
+            f"**{substitute}** to collect them."
+        )
     if substitute:
+        head = (
+            f"“{candidate}” is a real symbol with listed options, but {provider} "
+            "does not serve its option chain, so there would be nothing to collect."
+        )
         return f"{head} **{substitute}** tracks the same underlying and {_CARRY_OVER}"
+    # VIX, the one symbol refused with nothing to offer. Not "the source has no
+    # chain": Yahoo lists one, and saying otherwise is the kind of claim the
+    # person who trades it knows to be false.
     return (
-        f"{head} There is no honest substitute: an ETF on VIX futures is a "
-        "different instrument with its own term structure, not a proxy for the index."
+        f"“{candidate}” is a real symbol with listed options, but they are priced off "
+        f"VIX futures, which {provider} does not serve — every greek computed here would "
+        "be wrong, so it is not collected. There is no honest substitute: an ETF on VIX "
+        "futures is a different instrument with its own term structure, not a proxy for "
+        "the index."
     )
 
 
