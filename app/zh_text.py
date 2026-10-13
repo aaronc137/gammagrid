@@ -1137,6 +1137,7 @@ CSS_TOGGLE = """
   .st-key-gg-lang {
     position: fixed; top: 0.55rem; right: 3.4rem; z-index: 1000000;
     width: auto !important;
+    background: #0A0C0B; border-radius: 6px; padding: 2px;
   }
   .st-key-gg-lang button { min-height: 1.9rem; padding: 0 0.7rem; }
 </style>

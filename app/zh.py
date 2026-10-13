@@ -189,13 +189,14 @@ def _walk_spec(node, plotly: bool):
         for key, value in node.items():
             if key in ("title", "text", "name", "hovertemplate") and isinstance(value, str):
                 out[key] = tr(value)
-            elif key in ("title", "text", "ticktext") and isinstance(value, list):
+            elif key in ("title", "text", "ticktext") and isinstance(value, (list, tuple)):
                 out[key] = [tr(v) for v in value]
-            elif plotly and key == "x" and isinstance(value, list) and all(
+            elif plotly and key == "x" and isinstance(value, (list, tuple)) and all(
                 isinstance(v, str) and v in zh_text.CATALOG for v in value
             ):
                 out[key] = [tr(v) for v in value]  # 瀑布图的类目轴
-            elif key in ("data", "datasets", "values", "z", "y", "customdata"):
+            elif key in ("datasets", "values", "z", "y", "customdata") or (key == "data" and not plotly):
+                # Vega 的 data 是数据本身; Plotly 的 data 是轨迹列表(名字、类目轴在里面), 要进去翻
                 out[key] = value
             else:
                 out[key] = _walk_spec(value, plotly)
