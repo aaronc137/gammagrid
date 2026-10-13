@@ -65,5 +65,9 @@ jobs:
       - name: Chinese UI
         run: python tests/zh_check.py
 
+      # morning-bites: 托管版行情功能的本地补全(app/mb_extras.py)
+      - name: Market extras
+        run: python tests/extras_check.py
+
       - name: Docker build
         run: docker build -t gammagrid .

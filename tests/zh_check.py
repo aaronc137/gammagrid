@@ -144,7 +144,28 @@ def render_all(language: str) -> dict[str, list[str]]:
     return seen
 
 
+def check_plotly_categories():
+    """夹具只有一天历史, 画不出合约的瀑布图, 渲染那一遍看不见它的类目轴 —— 这里直接造一张。
+    Plotly 把 x 存成 tuple, 只认 list 的话整条轴漏翻(10-13 在线上看到过)。"""
+    import plotly.graph_objects as go
+
+    from app import zh
+
+    labels = ["Start", "Delta", "Gamma", "Vega", "Theta", "Residual", "End"]
+    figure = go.Figure(go.Waterfall(x=labels, y=[1, 2, 3, 4, 5, 6, 0]))
+    original = zh.lang
+    zh.lang = lambda: "zh"
+    try:
+        walked = zh._walk_spec(figure.to_dict(), plotly=True)
+    finally:
+        zh.lang = original
+    shown = list(walked["data"][0]["x"])
+    assert "Start" not in shown and "Residual" not in shown, shown
+    print("plotly category check passed (waterfall axis translated)")
+
+
 def main():
+    check_plotly_categories()
     dump = "--dump" in sys.argv
     from zoneinfo import ZoneInfo
 

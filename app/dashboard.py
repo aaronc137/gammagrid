@@ -23,6 +23,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     freshness,
     guide,
     market_calendar,
+    mb_extras,
     metrics,
     providers,
     suggestions,
@@ -152,7 +153,9 @@ def render_option_detail(
 
     with price_column:
         st.subheader("Option price")
-        st.line_chart(with_viewer_index(greeks_history)["last_price"], color=BRAND_PURPLE)
+        mb_extras.price_chart(  # morning-bites: 加理论价线
+            greeks_history, opt_strike, opt_expiry, opt_type, with_viewer_index, [BRAND_PURPLE, "#8B948F"]
+        )
     with howto("Contract"):
         st.write(
             "Price history of this specific contract (last price at each collection). "
@@ -192,6 +195,7 @@ def render_option_detail(
         )
 
     st.subheader("Greeks over time")
+    mb_extras.greek_units()  # morning-bites
     greek_cols = ["delta", "gamma", "theta", "vega", "rho", "vanna", "charm"]
     left, right = st.columns(2)
     for i, greek in enumerate(greek_cols):
@@ -996,6 +1000,7 @@ def get_tracked() -> pd.DataFrame:
 _weather = metrics.gamma_weather(latest_df)
 if _weather:
     st.markdown(weather.panel(_weather, latest_moment=latest_date), unsafe_allow_html=True)
+    mb_extras.since_strip(conn, selected_ticker, page_source, latest_df, _weather, with_our_iv)  # morning-bites
     zh.note("weather")  # morning-bites: 天气卡片的读法
 
 VIEWS = [
@@ -1147,6 +1152,7 @@ if active_view == "Changes":
         # somebody to pick it and read an error as a defect.
         _default_after = _days[0]
         _default_before = _days[1] if len(_days) > 1 else _days[0]
+        _default_before = mb_extras.compare_presets(_days, _default_before)  # morning-bites: 1 天 / 1 周 / 1 月
         left, right = st.columns(2)
         day_before = left.selectbox(
             "Compare from", _days, index=_days.index(_default_before), key="changes_from",
@@ -1331,6 +1337,7 @@ if active_view == "Max Pain / GEX":
             "strengthens closer to the expiry date. It is not a guaranteed forecast but a "
             "tendency that fundamental news can override."
         )
+    mb_extras.max_pain_extras(latest_df, selected_expiry, latest_date)  # morning-bites: 持仓覆盖面 + 预期波动
 
     st.subheader("Approximate Gamma Exposure (GEX)")
     gex = metrics.gamma_exposure_profile(latest_df, selected_expiry)
