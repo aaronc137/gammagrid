@@ -22,8 +22,8 @@ textColor = "#EDEFEC"
 borderColor = "#2A332E"
 linkColor = "#6EDE9A"
 
-font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
-headingFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif"
+headingFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif"
 codeFont = "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace"
 
 # The type scale: four sizes and no others, plus a hero size for a number that
