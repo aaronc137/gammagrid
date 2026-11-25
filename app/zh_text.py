@@ -17,7 +17,9 @@
 
 CATALOG: dict[str, str] = {
     "Language": "语言",  # 右上角切换(标签隐藏, 读屏会读)
-    "cboe": "Cboe",  # 句中出现的数据源名(库里存小写)
+    # 句中出现的数据源名(库里存小写)。2026-11-20 Cboe 停止回应个股请求后, 个股的链来自 Schwab(晨刊转写成 Cboe 的格式,
+    # 库里仍记作 cboe), 所以写成两家
+    "cboe": "Cboe/Schwab",
     "yahoo": "Yahoo",
 }
 TEMPLATES: list[tuple[str, str]] = []
@@ -105,8 +107,10 @@ CATALOG.update({
     "and Asian listings (SAP.DE, ASML.AS) have no options data here, but "
     "most large non-US companies also trade in the US as ADRs, which do: "
     "try ASML, SAP, SHEL, NVO, BUD.":
-        "按代码或公司名搜索,也可以直接输入列表里没有的代码。本站数据来自 Cboe 的延迟行情"
-        "(SPY、QQQ、SPX 与晨刊共用同一份),并不是每条挂牌的期权链都取得到。只支持美国上市的期权——"
+        "按代码或公司名搜索,也可以直接输入列表里没有的代码。SPX、SPY、QQQ 来自 Cboe 的延迟行情"
+        "(与晨刊共用同一份); 其余标的在 2026-11-20 Cboe 停止回应个股请求后改为来自 Schwab 期权链"
+        "(晨刊每日盘前、收盘后两班转写),"
+        "并不是每条挂牌的期权链都取得到。只支持美国上市的期权——"
         "欧洲和亚洲的挂牌(SAP.DE、ASML.AS)在这里没有期权数据,但大多数大型非美公司"
         "也以 ADR 形式在美国交易,ADR 是有期权数据的:可以试试 ASML、SAP、SHEL、NVO、BUD。",
     # dashboard.py:563-567
@@ -297,6 +301,13 @@ TEMPLATES += [
      r"so it will not be requested again\. Nothing has been deleted\.",
      "失败:{0}——这个代码已失败 {1} 次且从未采集到任何数据,今后不再请求。没有删除任何数据。"),
     (r"failed: (.+)", "失败:{0}"),
+    # cboe.py NoRawToday(GEX_RAW_ONLY=1): 晨刊没写这只票今天的链, 也不向 Cboe 请求
+    (r"No morning-bites raw for ([^\s]+) today \(no request\)\.", "晨刊今天还没有 {0} 的期权链文件(未向 Cboe 请求)"),
+    # cboe.py UnusableRaw: 文件在, 但用不了
+    (r"No morning-bites raw for ([^\s]+) today: its file has no readable timestamp\.",
+     "晨刊今天 {0} 的期权链文件没有可读的时间戳, 不使用"),
+    (r"No morning-bites raw for ([^\s]+) today: its file is stamped (.+) UTC, not today \((.+) ET\)\.",
+     "晨刊 {0} 的期权链文件时间是 {1} UTC, 不是今天({2} ET), 不使用"),
     (r"closed: (.+)", "休市:{0}"),
     (r"skipped: (.+)", "已跳过:{0}"),
     # collector.py:146-149 冷却中
@@ -722,7 +733,7 @@ CATALOG.update({
     # dashboard.py:1375(需要裁决: 「用 Black-Scholes 估算」)
     "Estimated via the Black-Scholes formula and a sign heuristic (puts contribute "
     "negatively). Does not reflect actual market-maker positioning — an approximation only.":
-        "gamma 优先用数据源(Cboe)给的值, 缺失时用 Black-Scholes 补算; 正负按一条经验法则"
+        "gamma 优先用数据源给的值(指数三只为 Cboe, 个股为 Schwab), 缺失时用 Black-Scholes 补算; 正负按一条经验法则"
         "(Put 的贡献记为负)。不反映做市商的实际持仓——仅为近似。",
     # dashboard.py:1380
     "Positive total gamma — the market as a whole is more \"sticky\", range-bound: "
@@ -820,7 +831,8 @@ CATALOG.update({
     "and see how the picture looked at that moment — no new data is needed, and "
     "there is no real-time auto-refresh (collection happens only via the “Collect "
     "data” button).":
-        "每个单元格是某一行权价、某一到期日的近似 GEX（gamma 优先用 Cboe 给的值、缺失时用 Black-Scholes 补算，符号经验法则与"
+        "每个单元格是某一行权价、某一到期日的近似 GEX（gamma 优先用数据源给的值（指数三只为 Cboe，个股为 Schwab）、"
+        "缺失时用 Black-Scholes 补算，符号经验法则与"
         "「最大痛点 / GEX」页相同），基于同一张快照计算——不必逐个挑选到期日，整条期权链一次看全。"
         "数字做了缩写（1.2k = 1,200，1.5m = 1,500,000）——目视比较不需要精确值，"
         "文字短一些也能给到期日列腾出更多位置。绿色——正 GEX（做市商抑制波动），"

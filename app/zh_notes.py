@@ -2,7 +2,7 @@
 
 指南的正文没有开放许可, 这里是用自己的话重写的要点, 每块都附原课链接。
 指南与本 fork 代码不一致的地方, 以代码为准:
-  * gamma 优先用 Cboe 给的厂商值, 缺失才用 Black-Scholes 补(metrics_core._provider_gamma_or);
+  * gamma 优先用数据源给的厂商值(指数三只为 Cboe, 个股为 Schwab), 缺失才用 Black-Scholes 补(metrics_core._provider_gamma_or);
   * 翻转位: 只擦过零轴(幅度不到剖面最大值的万分之一)或离现价超过 25% 的穿零点都不算
     (metrics_core.GAMMA_FLIP_MIN_SHARE / GAMMA_FLIP_MAX_DISTANCE);
   * GEX 单位是「标的每动 1 点」, 晨刊印的是「每动 1%」, 两者差一个 现价/100 的系数。
@@ -43,7 +43,7 @@ NOTES: dict[str, tuple[str, str]] = {
 **各格的意思**
 - **净 GEX**: 估算值, 单位是「标的每涨跌 1 点, 做市商要买卖多少美元的股票来维持对冲」。
   晨刊印的是「每 1%」口径, 数量级差一个 现价/100 的系数, 正负号相同。这里的 gamma 优先用
-  Cboe 给的值, 缺失时才用 Black-Scholes 补算。
+  数据源给的值(指数三只为 Cboe, 个股为 Schwab), 缺失时才用 Black-Scholes 补算。
 - **正负号是一个假设, 不是观测**: 默认投资者多是卖 Call(备兑)、买 Put(保护), 所以做市商
   多持有 Call、空着 Put。投资者若在大量买 Call 或卖 Put, 这个符号就会错。
 - **Call 墙 / Put 墙**: 统计范围内未平仓 Call(Put)最多的行权价, 定义就这一条。常被当作
@@ -118,7 +118,7 @@ NOTES: dict[str, tuple[str, str]] = {
 (每 1 点、美元)。
 - 正 Gamma **不等于看涨**: 它只是让波动变小, 价格照样可以稳步下跌。
 - 敞口大多来自平值附近和临近到期的合约; GEX 是估算, 会随现价和时间在盘中变化, 即使持仓一天才更新一次。
-- 本站的 gamma 优先用 Cboe 给的值, 缺失时才用 Black-Scholes 补算。
+- 本站的 gamma 优先用数据源给的值(指数三只为 Cboe, 个股为 Schwab), 缺失时才用 Black-Scholes 补算。
 """
         + _src(("max-pain", "第 4 课 最大痛点"), ("dealer-gamma", "第 5 课 做市商与 Gamma")),
     ),

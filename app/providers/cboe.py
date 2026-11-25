@@ -53,7 +53,18 @@ convention the 324 replayed archive moments carry — and the collector refuses 
 store the same moment twice, so a second pass over the same raw is a no-op. A
 chain fetched by GET keeps the collector's wall clock as its moment.
 
-Modified for morning-bites, 2026-10-09. AGPL-3.0, same as the repository.
+RAW ONLY (`GEX_RAW_ONLY=1`, morning-bites 2026-11-25). From 2026-11-20 Cboe
+answers this host's single-name requests with 403, and morning-bites now writes
+every ticker's chain into the raw dir: SPX/SPY/QQQ from its own Cboe reads, the
+single names from its Schwab reads, converted to this file's shape
+(`domain::gg_cboe_shape` there; `mb_origin.source` says which). In this mode ANY
+ticker reads today's newest raw, and nothing in this module requests anything:
+a ticker with no raw fails with `NoRawToday` (collection), the spot likewise,
+the Add-ticker check answers None (let through, as on any unanswered check) and
+`check_access` answers from the raw dir. Exactly `1` turns it on; anything
+else, or unset, is the behaviour above.
+
+Modified for morning-bites, 2026-10-09 and 2026-11-25. AGPL-3.0, same as the repository.
 """
 
 from __future__ import annotations
@@ -63,6 +74,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -161,16 +173,51 @@ def quote_time(payload: dict) -> dt.datetime | None:
         return None
 
 
-def todays_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime | None = None) -> Path | None:
-    """Today's (ET) newest morning-bites raw for a shared ticker, whatever its age;
-    None when there is none yet today (and always None with no raw dir). A file
-    written after `now` does not count — the window is only ever bounded above."""
-    if not raw_dir or ticker.upper() not in SHARED_TICKERS:
+class NoRawToday(Exception):
+    """Raw-only mode: morning-bites wrote no chain for this ticker today, and none
+    is requested in its place."""
+
+    def __init__(self, ticker: str) -> None:
+        super().__init__(f"No morning-bites raw for {ticker.upper()} today (no request).")
+
+
+class UnusableRaw(NoRawToday, ValueError):
+    """Today's raw is there but cannot be used (no readable timestamp, or a
+    morning-bites body stamped on another day). Same prefix as NoRawToday, so it
+    never counts toward suspension (`db.is_missing_raw`): morning-bites' file is
+    at fault, not the symbol."""
+
+    def __init__(self, ticker: str, why: str) -> None:
+        Exception.__init__(self, f"No morning-bites raw for {ticker.upper()} today: {why}.")
+
+
+# The raw file's name parts (morning-bites' gex-raw-export.sh writes exactly these).
+RAW_SESSIONS = ("premarket", "intraday", "close")
+_RAW_TICKER = re.compile(r"[A-Z][A-Z0-9.-]{0,9}")
+
+
+def raw_only_from_env() -> bool:
+    """`GEX_RAW_ONLY` is on only when it is exactly `1`."""
+    return os.environ.get("GEX_RAW_ONLY") == "1"
+
+
+def todays_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime | None = None,
+               any_ticker: bool = False) -> Path | None:
+    """Today's (ET) newest morning-bites raw for a shared ticker (any ticker with
+    `any_ticker`, the raw-only mode), whatever its age; None when there is none
+    yet today (and always None with no raw dir). A file written after `now` does
+    not count — the window is only ever bounded above."""
+    if not raw_dir or (not any_ticker and ticker.upper() not in SHARED_TICKERS):
+        return None
+    # the name is exact: a ticker outside the grammar is no file at all (`../X`,
+    # `*`), and a literal one never matches another's (`B` is not BRK-B's)
+    if not _RAW_TICKER.fullmatch(ticker.upper()):
         return None
     now = now or dt.datetime.now(_ET)
+    names = [f"{now:%Y-%m-%d}-{session}-{url_ticker(ticker)}.json.gz" for session in RAW_SESSIONS]
     candidates = [
-        path for path in Path(raw_dir).glob(f"{now:%Y-%m-%d}-*-{url_ticker(ticker)}.json.gz")
-        if path.stat().st_mtime <= now.timestamp()
+        path for path in (Path(raw_dir) / name for name in names)
+        if path.is_file() and path.stat().st_mtime <= now.timestamp()
     ]
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
@@ -196,21 +243,40 @@ class CboeProvider:
     unsupported_symbols: dict[str, str | None] = {}
     token: str | None = None
 
-    def __init__(self, raw_dir: str | os.PathLike | None = None) -> None:
+    def __init__(self, raw_dir: str | os.PathLike | None = None, raw_only: bool | None = None) -> None:
         self._yahoo = YahooProvider()
         self.raw_dir = raw_dir if raw_dir is not None else os.environ.get("GEX_RAW_DIR") or None
+        self.raw_only = raw_only_from_env() if raw_only is None else raw_only
+
+    def _raw_payload(self, ticker: str, now: dt.datetime) -> dict | None:
+        """Today's raw for `ticker`, parsed, or None. Raw-only reads any ticker's."""
+        raw = todays_raw(self.raw_dir, ticker, now, any_ticker=self.raw_only)
+        if raw is None:
+            return None
+        with gzip.open(raw, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        origin = (payload.get("mb_origin") or {}).get("source") if isinstance(payload, dict) else None
+        if origin:
+            log.info("%s: read morning-bites raw %s (%s, no request)", ticker, raw.name, origin)
+        else:
+            log.info("%s: read morning-bites raw %s (no request)", ticker, raw.name)
+        return payload
 
     def fetch_underlying_price(self, ticker: str) -> float:
+        if self.raw_only:
+            payload = self._raw_payload(ticker, dt.datetime.now(_ET))
+            if payload is None:
+                raise NoRawToday(ticker)
+            return float(payload["data"]["current_price"])
         return float(_get(ticker)["data"]["current_price"])
 
     def fetch_ticker_snapshot(self, ticker: str) -> tuple[float, pd.DataFrame]:
         now = dt.datetime.now(_ET)
-        raw = todays_raw(self.raw_dir, ticker, now)
-        if raw is not None:
-            with gzip.open(raw, "rt", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            log.info("%s: read morning-bites raw %s (no request)", ticker, raw.name)
-        else:
+        payload = self._raw_payload(ticker, now)
+        from_raw = payload is not None
+        if not from_raw:
+            if self.raw_only:
+                raise NoRawToday(ticker)
             if self.raw_dir and ticker.upper() in SHARED_TICKERS:
                 log.warning(
                     "%s: 晨刊 raw 缺席(%s 里还没有 %s 的文件), 回落直取 Cboe —— "
@@ -219,7 +285,19 @@ class CboeProvider:
                 )
             payload = _get(ticker)
         spot, frame = chain_from_payload(payload, now.date())
-        if raw is not None:
+        if from_raw:
+            stamp = quote_time(payload)
+            if stamp is None:
+                # the collector would fall back to the wall clock and store the same
+                # chain again on every pass
+                raise UnusableRaw(ticker, "its file has no readable timestamp")
+            if (payload.get("mb_origin") or {}).get("source"):
+                # a body morning-bites wrote is stamped with its read: today's or stale
+                # (Cboe's own stamp on SPX/SPY/QQQ is its last quote, which may not be today)
+                stamp_day = stamp.replace(tzinfo=dt.timezone.utc).astimezone(_ET).date()
+                if stamp_day != now.date():
+                    raise UnusableRaw(
+                        ticker, f"its file is stamped {stamp:%Y-%m-%d %H:%M:%S} UTC, not today ({now:%Y-%m-%d} ET)")
             # The raw's own moment, for the collector (see the module docstring). Only
             # for the raw path: on a GET the wall clock stays the moment, because
             # Cboe's stamp is the last quote and sits still for days on a thin name
@@ -233,7 +311,10 @@ class CboeProvider:
 
     def underlying_has_options(self, ticker: str) -> bool | None:
         """True/False from one GET; None when Cboe could not answer (the
-        caller lets the ticker through on None — see yahoo.py)."""
+        caller lets the ticker through on None — see yahoo.py). Raw-only: None,
+        with no request."""
+        if self.raw_only:
+            return None
         try:
             return bool(_get(ticker)["data"].get("options"))
         except urllib.error.HTTPError as exc:
@@ -242,6 +323,13 @@ class CboeProvider:
             return None
 
     def check_access(self) -> ProviderStatus:
+        if self.raw_only:
+            # no request: whether the files morning-bites writes can be read at all
+            if self.raw_dir and Path(self.raw_dir).is_dir():
+                return ProviderStatus(
+                    True, f"Raw-only: chains are read from morning-bites' files in {self.raw_dir}. "
+                          "No request is made.")
+            return ProviderStatus(False, f"Raw-only, but the raw dir {self.raw_dir!r} is not a directory.")
         try:
             spot = self.fetch_underlying_price("SPY")
         except Exception as exc:  # noqa: BLE001

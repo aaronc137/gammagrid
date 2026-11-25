@@ -156,6 +156,12 @@ def refresh_if_due(conn: psycopg.Connection, force: bool = False) -> int:
     caller's behaviour is the same either way: this is a convenience, and no
     part of collecting or drawing depends on it.
     """
+    # morning-bites raw-only (GEX_RAW_ONLY=1): this host requests nothing from Cboe,
+    # the directory included; the Add-ticker box keeps what it has or is a text field
+    from app.providers.cboe import raw_only_from_env
+
+    if raw_only_from_env():
+        return 0
     if not force and not is_empty(conn) and not _is_due(conn):
         return 0
     try:
