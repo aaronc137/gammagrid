@@ -17,7 +17,7 @@
 
 CATALOG: dict[str, str] = {
     "Language": "语言",  # 右上角切换(标签隐藏, 读屏会读)
-    # 句中出现的数据源名(库里存小写)。2026-11-26 起个股的链来自 Schwab(晨刊转写成 Cboe 的格式,
+    # 句中出现的数据源名(库里存小写)。2026-11-20 Cboe 停止回应个股请求后, 个股的链来自 Schwab(晨刊转写成 Cboe 的格式,
     # 库里仍记作 cboe), 所以写成两家
     "cboe": "Cboe/Schwab",
     "yahoo": "Yahoo",
@@ -108,7 +108,8 @@ CATALOG.update({
     "most large non-US companies also trade in the US as ADRs, which do: "
     "try ASML, SAP, SHEL, NVO, BUD.":
         "按代码或公司名搜索,也可以直接输入列表里没有的代码。SPX、SPY、QQQ 来自 Cboe 的延迟行情"
-        "(与晨刊共用同一份); 其余标的自 2026-11-26 起来自 Schwab 期权链(晨刊每日盘前、收盘后两班转写),"
+        "(与晨刊共用同一份); 其余标的在 2026-11-20 Cboe 停止回应个股请求后改为来自 Schwab 期权链"
+        "(晨刊每日盘前、收盘后两班转写),"
         "并不是每条挂牌的期权链都取得到。只支持美国上市的期权——"
         "欧洲和亚洲的挂牌(SAP.DE、ASML.AS)在这里没有期权数据,但大多数大型非美公司"
         "也以 ADR 形式在美国交易,ADR 是有期权数据的:可以试试 ASML、SAP、SHEL、NVO、BUD。",
