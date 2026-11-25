@@ -803,7 +803,9 @@ def check_archiving_goes_through_the_registry():
         _chain_row(live, 20.0, "call"),
     ]))
     moved = db.archive_expired_contracts(conn, grace_days=30)
-    assert moved == 1, f"exactly the expired contract moves, got {moved}"
+    # the count is the whole database's: other checks' fixed-date chains expire as
+    # the calendar moves on, so only this ticker's own rows are exact
+    assert moved >= 1, f"the expired contract moves, got {moved}"
 
     # The hot table specifically, not db.get_snapshots — that reads both tables
     # by design, so it would show the same two rows whether archiving worked or
@@ -815,7 +817,7 @@ def check_archiving_goes_through_the_registry():
     archived = conn.execute(
         "SELECT count(*) FROM option_snapshots_archive WHERE ticker = 'ARCH'"
     ).fetchone()[0]
-    assert archived == 1, "the row is moved, never deleted"
+    assert archived == 1, f"exactly the expired contract is moved, never deleted, got {archived}"
     # And the reader still sees both halves — which is the point of moving
     # rather than deleting.
     assert len(db.get_snapshots(conn, "ARCH", days=None)) == 2
@@ -2723,7 +2725,7 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
     from app.providers import cboe
 
     payload = {"timestamp": "2026-10-09 13:00:06", "data": {"current_price": 100.0, "options": [
-        {"option": "SPY261017C00100000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
+        {"option": "SPY291221C00100000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
          "volume": 5, "open_interest": 10, "iv": 0.2, "delta": 0.5, "gamma": 0.01, "theta": -0.1, "vega": 0.3}]}}
     gets = []
     original_get = cboe._get

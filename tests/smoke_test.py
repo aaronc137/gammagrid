@@ -153,7 +153,13 @@ def check_archiving_moves_and_keeps(conn):
     assert len(before) == 2, before
 
     moved = db.archive_expired_contracts(conn, grace_days=30)
-    assert moved == 1, f"exactly the long-expired contract should have moved, got {moved}"
+    # the count is the whole database's: other checks' fixed-date chains expire as
+    # the calendar moves on, so this ticker's own rows are what is exact
+    assert moved >= 1, f"the long-expired contract should have moved, got {moved}"
+    archived = conn.execute(
+        "SELECT count(*) FROM option_snapshots_archive WHERE ticker = %s", (ticker,)
+    ).fetchone()[0]
+    assert archived == 1, f"exactly the long-expired contract should have moved, got {archived}"
 
     hot = conn.execute(
         "SELECT count(*) FROM option_snapshots WHERE ticker = %s", (ticker,)
