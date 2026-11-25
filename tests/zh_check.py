@@ -24,7 +24,7 @@ from google.protobuf.json_format import MessageToDict  # noqa: E402
 ALLOWED = {
     "gex", "iv", "oi", "dte", "rv", "atm", "otm", "itm", "pcr", "call", "calls", "put", "puts",
     "delta", "gamma", "theta", "vega", "rho", "vanna", "charm", "black", "scholes",
-    "cboe", "yahoo", "yfinance", "finance", "gammagrid", "tradingview", "github",
+    "cboe", "schwab", "yahoo", "yfinance", "finance", "gammagrid", "tradingview", "github",
     "utc", "edt", "est", "cet", "cest", "new", "york", "nyse", "spx", "spy", "qqq", "xsp",
     "ndx", "rut", "djx", "vix", "rendertest", "en", "etf", "etfs", "adr", "adrs", "occ",
     "max", "pain", "open", "interest", "http", "https", "www", "io", "guide", "com",

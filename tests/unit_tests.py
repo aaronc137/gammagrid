@@ -2722,8 +2722,10 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
 
     from app.providers import cboe
 
+    # A far expiry: the 2026-10-17 one this check had dropped out as expired from
+    # 2026-10-18 on, and the check went red on the date alone.
     payload = {"timestamp": "2026-10-09 13:00:06", "data": {"current_price": 100.0, "options": [
-        {"option": "SPY261017C00100000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
+        {"option": "SPY291221C00100000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
          "volume": 5, "open_interest": 10, "iv": 0.2, "delta": 0.5, "gamma": 0.01, "theta": -0.1, "vega": 0.3}]}}
     gets = []
     original_get = cboe._get
@@ -2780,6 +2782,115 @@ def check_cboe_reads_the_morning_bites_raw_instead_of_requesting():
         cboe._get = original_get
         cboe.log.removeHandler(catcher)
     print("Cboe provider reads today's morning-bites raw and requests only without one")
+
+
+def check_raw_only_reads_every_ticker_and_never_requests():
+    """morning-bites (GEX_RAW_ONLY=1, 2026-11-25): Cboe answers this host's
+    single-name requests with 403, so morning-bites writes every ticker's chain
+    (SPX/SPY/QQQ from Cboe, the rest from Schwab) into the raw dir. In raw-only
+    mode any ticker reads today's raw; with none there is no request on ANY path
+    (collection, the Add-ticker check, check_access, the spot) and the failure
+    names the ticker."""
+    import gzip
+    import json
+    import tempfile
+
+    from app.providers import cboe
+
+    payload = {"timestamp": "2026-11-25 13:35:07", "data": {"current_price": 180.5, "options": [
+        {"option": "AAPL271217C00200000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
+         "volume": 5, "open_interest": 10, "iv": 0.2, "delta": 0.5, "gamma": 0.01, "theta": -0.1, "vega": 0.3}]},
+        "mb_origin": {"source": "schwab"}}
+    gets = []
+    original_get = cboe._get
+    cboe._get = lambda ticker: (gets.append(ticker), payload)[1]
+    original_env = os.environ.get("GEX_RAW_ONLY")
+    try:
+        os.environ["GEX_RAW_ONLY"] = "1"
+        assert cboe.CboeProvider(raw_dir="x").raw_only is True
+        for off in ("0", "", "yes", " 1"):
+            os.environ["GEX_RAW_ONLY"] = off
+            assert cboe.CboeProvider(raw_dir="x").raw_only is False, off
+        os.environ.pop("GEX_RAW_ONLY")
+        assert cboe.CboeProvider(raw_dir="x").raw_only is False
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            today = dt.datetime.now(cboe._ET)
+            with gzip.open(os.path.join(raw_dir, f"{today:%Y-%m-%d}-premarket-AAPL.json.gz"), "wt",
+                           encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            provider = cboe.CboeProvider(raw_dir=raw_dir, raw_only=True)
+
+            spot, frame = provider.fetch_ticker_snapshot("AAPL")  # a single name, read from its raw
+            assert gets == [] and spot == 180.5 and len(frame) == 1, (gets, spot, len(frame))
+            assert frame.attrs["collected_at"] == dt.datetime(2026, 11, 25, 13, 35, 7), frame.attrs
+            assert provider.fetch_underlying_price("AAPL") == 180.5 and gets == []
+
+            for ticker in ("MSFT", "SPY"):  # no raw today: no request, not even SPY's old fallback
+                try:
+                    provider.fetch_ticker_snapshot(ticker)
+                except cboe.NoRawToday as exc:
+                    assert str(exc) == f"No morning-bites raw for {ticker} today (no request).", str(exc)
+                else:
+                    raise AssertionError(f"{ticker}: a missing raw must fail")
+            try:
+                provider.fetch_underlying_price("MSFT")
+            except cboe.NoRawToday:
+                pass
+            else:
+                raise AssertionError("a spot with no raw must fail")
+            assert provider.underlying_has_options("ZZZZ") is None  # the Add-ticker check lets it through
+            status = provider.check_access()
+            assert status.ok and raw_dir in status.message, status
+            assert not cboe.CboeProvider(raw_dir=os.path.join(raw_dir, "absent"), raw_only=True).check_access().ok
+            assert not cboe.CboeProvider(raw_dir=None, raw_only=True).check_access().ok
+            try:
+                cboe.CboeProvider(raw_dir=None, raw_only=True).fetch_ticker_snapshot("AAPL")
+            except cboe.NoRawToday:
+                pass
+            else:
+                raise AssertionError("raw-only with no raw dir must fail, never request")
+            assert gets == [], gets
+
+            # Off, behaviour is upstream's: a single name is a request.
+            cboe.CboeProvider(raw_dir=raw_dir, raw_only=False).fetch_ticker_snapshot("AAPL")
+            assert gets == ["AAPL"], gets
+    finally:
+        cboe._get = original_get
+        if original_env is None:
+            os.environ.pop("GEX_RAW_ONLY", None)
+        else:
+            os.environ["GEX_RAW_ONLY"] = original_env
+    from app import zh
+    assert zh.translate("MSFT: failed: No morning-bites raw for MSFT today (no request).") == (
+        "MSFT：失败：晨刊今天还没有 MSFT 的期权链文件（未向 Cboe 请求）"), zh.translate(
+        "MSFT: failed: No morning-bites raw for MSFT today (no request).")
+    print("raw-only: every ticker reads its raw, and nothing is ever requested")
+
+
+def check_the_morning_bites_schwab_fixture_parses():
+    """The file morning-bites' converter writes for a Schwab chain
+    (`domain::gg_cboe_shape`, its fixture copied here byte for byte) parses into
+    the stored columns: IV a decimal, a broken contract's greeks missing, the
+    moment the read's stamp."""
+    import json
+
+    from app.providers import cboe
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "fixtures", "mb_gg_feed_nvda_cboe_shape.json"), encoding="utf-8") as handle:
+        payload = json.load(handle)
+    spot, frame = cboe.chain_from_payload(payload, dt.date(2026, 11, 25))
+    assert spot == 180.5, spot
+    assert len(frame) == 4 and list(frame["contract_symbol"]) == [
+        "NVDA261218C00180000", "NVDA261218C00185000", "NVDA261218P00175000", "NVDA261218P00180000"]
+    first = frame.iloc[0]
+    assert first["implied_volatility"] == 0.455 and first["gamma"] == 0.018 and first["open_interest"] == 20000
+    nulled = frame.iloc[1]
+    assert pd.isna(nulled["implied_volatility"]) and pd.isna(nulled["gamma"]) and pd.isna(nulled["delta"])
+    assert frame.iloc[2]["volume"] == 0 and pd.isna(frame.iloc[2]["last_price"])
+    assert cboe.quote_time(payload) == dt.datetime(2026, 11, 25, 13, 35, 7)
+    print("morning-bites' Schwab-converted fixture parses into the stored columns")
 
 
 def check_the_collector_stores_a_source_moment_once():
@@ -2874,6 +2985,8 @@ def main():
     check_provider_gamma_is_preferred()
     check_cboe_reads_the_morning_bites_raw_instead_of_requesting()
     check_the_collector_stores_a_source_moment_once()
+    check_raw_only_reads_every_ticker_and_never_requests()
+    check_the_morning_bites_schwab_fixture_parses()
     check_a_grazing_crossing_is_not_a_flip()
     check_a_far_flip_is_no_flip()
     check_gamma_flip_by_depth_is_each_crop()

@@ -1,0 +1,73 @@
+{
+  "data": {
+    "current_price": 180.5,
+    "options": [
+      {
+        "ask": 7.3,
+        "bid": 7.1,
+        "delta": 0.52,
+        "gamma": 0.018,
+        "iv": 0.455,
+        "last_trade_price": 7.2,
+        "open_interest": 20000.0,
+        "option": "NVDA261218C00180000",
+        "theta": -0.12,
+        "vega": 0.21,
+        "volume": 1500.0
+      },
+      {
+        "ask": 5.2,
+        "bid": 5.0,
+        "delta": null,
+        "gamma": null,
+        "iv": null,
+        "last_trade_price": 5.1,
+        "open_interest": 15000.0,
+        "option": "NVDA261218C00185000",
+        "theta": null,
+        "vega": null,
+        "volume": 900.0
+      },
+      {
+        "ask": 4.1,
+        "bid": 3.9,
+        "delta": -0.31,
+        "gamma": 0.015,
+        "iv": 0.4725,
+        "last_trade_price": null,
+        "open_interest": 9000.0,
+        "option": "NVDA261218P00175000",
+        "theta": -0.09,
+        "vega": 0.19,
+        "volume": 0.0
+      },
+      {
+        "ask": 6.2,
+        "bid": 6.0,
+        "delta": null,
+        "gamma": null,
+        "iv": 0.46,
+        "last_trade_price": 6.1,
+        "open_interest": 18000.0,
+        "option": "NVDA261218P00180000",
+        "theta": null,
+        "vega": null,
+        "volume": 1200.0
+      }
+    ],
+    "symbol": "NVDA"
+  },
+  "mb_origin": {
+    "adjusted_left_out": 1,
+    "greeks_nulled": 2,
+    "raw_sha256": [
+      "made-up-sha"
+    ],
+    "source": "schwab",
+    "spot_basis": "underlying_last",
+    "stamp": "2026-11-25T13:35:07Z",
+    "windows": 1
+  },
+  "symbol": "NVDA",
+  "timestamp": "2026-11-25 13:35:07"
+}
