@@ -181,6 +181,16 @@ class NoRawToday(Exception):
         super().__init__(f"No morning-bites raw for {ticker.upper()} today (no request).")
 
 
+class UnusableRaw(NoRawToday, ValueError):
+    """Today's raw is there but cannot be used (no readable timestamp, or a
+    morning-bites body stamped on another day). Same prefix as NoRawToday, so it
+    never counts toward suspension (`db.is_missing_raw`): morning-bites' file is
+    at fault, not the symbol."""
+
+    def __init__(self, ticker: str, why: str) -> None:
+        Exception.__init__(self, f"No morning-bites raw for {ticker.upper()} today: {why}.")
+
+
 # The raw file's name parts (morning-bites' gex-raw-export.sh writes exactly these).
 RAW_SESSIONS = ("premarket", "intraday", "close")
 _RAW_TICKER = re.compile(r"[A-Z][A-Z0-9.-]{0,9}")
@@ -280,14 +290,14 @@ class CboeProvider:
             if stamp is None:
                 # the collector would fall back to the wall clock and store the same
                 # chain again on every pass
-                raise ValueError("morning-bites raw has no readable timestamp")
+                raise UnusableRaw(ticker, "its file has no readable timestamp")
             if (payload.get("mb_origin") or {}).get("source"):
                 # a body morning-bites wrote is stamped with its read: today's or stale
                 # (Cboe's own stamp on SPX/SPY/QQQ is its last quote, which may not be today)
                 stamp_day = stamp.replace(tzinfo=dt.timezone.utc).astimezone(_ET).date()
                 if stamp_day != now.date():
-                    raise ValueError(
-                        f"morning-bites raw is stamped {stamp:%Y-%m-%d %H:%M:%S} UTC, not today ({now:%Y-%m-%d} ET)")
+                    raise UnusableRaw(
+                        ticker, f"its file is stamped {stamp:%Y-%m-%d %H:%M:%S} UTC, not today ({now:%Y-%m-%d} ET)")
             # The raw's own moment, for the collector (see the module docstring). Only
             # for the raw path: on a GET the wall clock stays the moment, because
             # Cboe's stamp is the last quote and sits still for days on a thin name

@@ -2952,7 +2952,8 @@ def check_a_raw_needs_a_readable_stamp_of_today():
             try:
                 provider.fetch_ticker_snapshot(ticker)
             except ValueError as exc:
-                assert str(exc) == "morning-bites raw has no readable timestamp", str(exc)
+                assert isinstance(exc, cboe.NoRawToday), type(exc)
+                assert str(exc) == f"No morning-bites raw for {ticker} today: its file has no readable timestamp.", str(exc)
             else:
                 raise AssertionError(f"{ticker}: a raw with no readable timestamp must be refused")
         old = (now_utc - dt.timedelta(days=2)).replace(tzinfo=None)
@@ -2960,9 +2961,19 @@ def check_a_raw_needs_a_readable_stamp_of_today():
         try:
             provider.fetch_ticker_snapshot("NVDA")
         except ValueError as exc:
-            assert "not today" in str(exc), str(exc)
+            assert isinstance(exc, cboe.NoRawToday), type(exc)
+            assert str(exc).startswith("No morning-bites raw for NVDA today: its file is stamped "), str(exc)
+            assert f"UTC, not today ({today:%Y-%m-%d} ET)." in str(exc), str(exc)
         else:
             raise AssertionError("a morning-bites body stamped on another day must be refused")
+        # both read in Chinese, as NoRawToday does
+        from app.zh import translate
+
+        zh = translate("failed: No morning-bites raw for AAPL today: its file has no readable timestamp.")
+        assert "AAPL" in zh and "时间戳" in zh and "No morning" not in zh, zh
+        zh = translate("failed: No morning-bites raw for NVDA today: its file is stamped "
+                       "2026-11-22 13:35:07 UTC, not today (2026-11-24 ET).")
+        assert "NVDA" in zh and "2026-11-22" in zh and "不是今天" in zh and "No morning" not in zh, zh
         good = now_utc.replace(tzinfo=None)
         _raw_file(raw_dir, f"{today:%Y-%m-%d}-premarket-TSLA.json.gz", _raw_body(f"{good:%Y-%m-%d %H:%M:%S}"))
         _, frame = provider.fetch_ticker_snapshot("TSLA")
@@ -2979,12 +2990,18 @@ def check_a_missing_raw_never_suspends_a_ticker():
 
     conn = db.get_connection()
     who = "NORAWCHK"
-    message = str(cboe.NoRawToday(who))
-    assert db.is_missing_raw(message) and not db.is_missing_raw("no price for X") and not db.is_missing_raw(None)
+    messages = [
+        str(cboe.NoRawToday(who)),
+        str(cboe.UnusableRaw(who, "its file has no readable timestamp")),
+        str(cboe.UnusableRaw(who, "its file is stamped 2026-11-20 13:35:07 UTC, not today (2026-11-23 ET)")),
+    ]
+    for message in messages:
+        assert db.is_missing_raw(message), message
+    assert not db.is_missing_raw("no price for X") and not db.is_missing_raw(None)
     start = dt.datetime(2026, 11, 23, 14, 0)  # a Monday, in session
     for n in range(config.UNRESOLVABLE_AFTER_FAILURES + 3):
         at = start + dt.timedelta(minutes=n)
-        db.log_run(conn, at, at + dt.timedelta(seconds=5), who, "failed", message, source="cboe")
+        db.log_run(conn, at, at + dt.timedelta(seconds=5), who, "failed", messages[n % 3], source="cboe")
     assert who not in db.unresolvable_tickers(conn)
     for n in range(config.UNRESOLVABLE_AFTER_FAILURES):
         at = start + dt.timedelta(hours=1, minutes=n)
@@ -3006,18 +3023,30 @@ def check_the_raw_name_is_matched_exactly():
 
     now = dt.datetime.now(cboe._ET)
     with tempfile.TemporaryDirectory() as raw_dir:
-        for name in ("BRK-B", "AB", "B-X"):
+        for name in ("BRK-B", "AB", "B-X", "ABCDEFGHIJK", "1AB"):
             _raw_file(raw_dir, f"{now:%Y-%m-%d}-premarket-{name}.json.gz", {})
         _raw_file(raw_dir, f"{now:%Y-%m-%d}-weird-B.json.gz", {})
         _raw_file(raw_dir, f"{now:%Y-%m-%d}-pre-close-C.json.gz", {})
+        # the lookup's moment is after every file written here (a file newer than `now` does
+        # not count), on the same ET day as the names
+        later = dt.datetime.now(cboe._ET) + dt.timedelta(seconds=5)
+        if later.date() != now.date():
+            later = now.replace(hour=23, minute=59, second=59)
+            for f in os.listdir(raw_dir):
+                os.utime(os.path.join(raw_dir, f), (now.timestamp(), now.timestamp()))
         for ticker in ("B", "*", "?", "[A]", "C", "-B", "../B"):
-            assert cboe.todays_raw(raw_dir, ticker, now, any_ticker=True) is None, ticker
+            assert cboe.todays_raw(raw_dir, ticker, later, any_ticker=True) is None, ticker
+        # a real file under a name outside the grammar is never read: too long, a digit first
+        for ticker in ("ABCDEFGHIJK", "1AB"):
+            assert os.path.exists(os.path.join(raw_dir, f"{now:%Y-%m-%d}-premarket-{ticker}.json.gz"))
+            assert cboe.todays_raw(raw_dir, ticker, later, any_ticker=True) is None, ticker
         for session in ("premarket", "close", "intraday"):
             _raw_file(raw_dir, f"{now:%Y-%m-%d}-{session}-B.json.gz", {})
-            got = cboe.todays_raw(raw_dir, "B", now, any_ticker=True)
+            os.utime(os.path.join(raw_dir, f"{now:%Y-%m-%d}-{session}-B.json.gz"), (now.timestamp(),) * 2)
+            got = cboe.todays_raw(raw_dir, "B", later, any_ticker=True)
             assert got is not None and got.name == f"{now:%Y-%m-%d}-{session}-B.json.gz", (session, got)
             os.remove(got)
-        assert cboe.todays_raw(raw_dir, "BRK-B", now, any_ticker=True).name.endswith("-premarket-BRK-B.json.gz")
+        assert cboe.todays_raw(raw_dir, "BRK-B", later, any_ticker=True).name.endswith("-premarket-BRK-B.json.gz")
     print("the raw name is matched exactly")
 
 

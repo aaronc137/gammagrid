@@ -303,6 +303,11 @@ TEMPLATES += [
     (r"failed: (.+)", "失败:{0}"),
     # cboe.py NoRawToday(GEX_RAW_ONLY=1): 晨刊没写这只票今天的链, 也不向 Cboe 请求
     (r"No morning-bites raw for ([^\s]+) today \(no request\)\.", "晨刊今天还没有 {0} 的期权链文件(未向 Cboe 请求)"),
+    # cboe.py UnusableRaw: 文件在, 但用不了
+    (r"No morning-bites raw for ([^\s]+) today: its file has no readable timestamp\.",
+     "晨刊今天 {0} 的期权链文件没有可读的时间戳, 不使用"),
+    (r"No morning-bites raw for ([^\s]+) today: its file is stamped (.+) UTC, not today \((.+) ET\)\.",
+     "晨刊 {0} 的期权链文件时间是 {1} UTC, 不是今天({2} ET), 不使用"),
     (r"closed: (.+)", "休市:{0}"),
     (r"skipped: (.+)", "已跳过:{0}"),
     # collector.py:146-149 冷却中

@@ -534,9 +534,10 @@ MISSING_RAW = "No morning-bites raw for "
 
 
 def is_missing_raw(error_message: str | None) -> bool:
-    """Whether a failed run was raw-only mode finding no morning-bites file for the
-    ticker today: morning-bites' gap, not the symbol's, so never a reason to stop
-    asking for it (`unresolvable_tickers`). It still shows as a failure."""
+    """Whether a failed run was raw-only mode finding no usable morning-bites file
+    for the ticker today (cboe.py NoRawToday, UnusableRaw): morning-bites' gap, not
+    the symbol's, so never a reason to stop asking for it (`unresolvable_tickers`).
+    It still shows as a failure."""
     return bool(error_message) and error_message.startswith(MISSING_RAW)
 
 
