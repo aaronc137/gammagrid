@@ -529,6 +529,17 @@ def get_recent_runs(conn: psycopg.Connection, limit: int = 50) -> pd.DataFrame:
 ZERO_OI_REFUSAL = "of contracts have open_interest=0"
 
 
+# morning-bites raw-only (app/providers/cboe.py NoRawToday): the message's fixed start
+MISSING_RAW = "No morning-bites raw for "
+
+
+def is_missing_raw(error_message: str | None) -> bool:
+    """Whether a failed run was raw-only mode finding no morning-bites file for the
+    ticker today: morning-bites' gap, not the symbol's, so never a reason to stop
+    asking for it (`unresolvable_tickers`). It still shows as a failure."""
+    return bool(error_message) and error_message.startswith(MISSING_RAW)
+
+
 def is_closed_market_refusal(started_at, error_message: str | None) -> bool:
     """Whether a failed run was the zero-open-interest guard firing while the
     market was shut — an outcome, not a failure.
@@ -587,7 +598,9 @@ def unresolvable_tickers(
 
     A closed-market refusal does not count (`is_closed_market_refusal`): a
     symbol whose chain arrived, zeroed overnight, exists — and a symbol added
-    on a Friday evening would otherwise be suspended by a long weekend.
+    on a Friday evening would otherwise be suspended by a long weekend. Nor
+    does a missing morning-bites raw (`is_missing_raw`): six passes without the
+    file are morning-bites' gap, not a hopeless symbol.
     """
     threshold = config.UNRESOLVABLE_AFTER_FAILURES if limit is None else limit
     rows = conn.execute(
@@ -598,7 +611,7 @@ def unresolvable_tickers(
     ).fetchall()
     counted: dict[str, list[datetime]] = {}
     for ticker, started_at, message in rows:
-        if not is_closed_market_refusal(started_at, message):
+        if not is_closed_market_refusal(started_at, message) and not is_missing_raw(message):
             counted.setdefault(ticker.upper(), []).append(started_at)
     return {ticker: moments[threshold - 1] for ticker, moments in counted.items() if len(moments) >= threshold}
 

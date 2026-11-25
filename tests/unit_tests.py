@@ -2797,8 +2797,9 @@ def check_raw_only_reads_every_ticker_and_never_requests():
 
     from app.providers import cboe
 
-    payload = {"timestamp": "2026-11-25 13:35:07", "data": {"current_price": 180.5, "options": [
-        {"option": "AAPL271217C00200000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
+    stamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0, tzinfo=None)
+    payload = {"timestamp": f"{stamp:%Y-%m-%d %H:%M:%S}", "data": {"current_price": 180.5, "options": [
+        {"option": "AAPL991217C00200000", "bid": 1.0, "ask": 1.2, "last_trade_price": 1.1,
          "volume": 5, "open_interest": 10, "iv": 0.2, "delta": 0.5, "gamma": 0.01, "theta": -0.1, "vega": 0.3}]},
         "mb_origin": {"source": "schwab"}}
     gets = []
@@ -2823,7 +2824,7 @@ def check_raw_only_reads_every_ticker_and_never_requests():
 
             spot, frame = provider.fetch_ticker_snapshot("AAPL")  # a single name, read from its raw
             assert gets == [] and spot == 180.5 and len(frame) == 1, (gets, spot, len(frame))
-            assert frame.attrs["collected_at"] == dt.datetime(2026, 11, 25, 13, 35, 7), frame.attrs
+            assert frame.attrs["collected_at"] == stamp, frame.attrs
             assert provider.fetch_underlying_price("AAPL") == 180.5 and gets == []
 
             for ticker in ("MSFT", "SPY"):  # no raw today: no request, not even SPY's old fallback
@@ -2891,6 +2892,133 @@ def check_the_morning_bites_schwab_fixture_parses():
     assert frame.iloc[2]["volume"] == 0 and pd.isna(frame.iloc[2]["last_price"])
     assert cboe.quote_time(payload) == dt.datetime(2026, 11, 25, 13, 35, 7)
     print("morning-bites' Schwab-converted fixture parses into the stored columns")
+
+
+def _raw_file(raw_dir, name, payload):
+    import gzip
+    import json
+
+    with gzip.open(os.path.join(raw_dir, name), "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
+def _raw_body(stamp):
+    body = {"data": {"current_price": 180.5, "options": [
+        {"option": "AAPL991217C00200000", "bid": 1.0, "ask": 1.2, "volume": 5, "open_interest": 10, "iv": 0.2}]},
+        "mb_origin": {"source": "schwab"}}
+    if stamp is not None:
+        body["timestamp"] = stamp
+    return body
+
+
+def check_raw_only_requests_no_symbol_directory():
+    """Review of fork PR #5: with GEX_RAW_ONLY=1 the weekly www.cboe.com symbol
+    directory is not fetched either; the worker's call answers 0 with no request."""
+    from app import catalogue, worker
+
+    calls = []
+    original = catalogue.fetch_directory
+    catalogue.fetch_directory = lambda *a, **k: calls.append(1) or []
+    original_env = os.environ.get("GEX_RAW_ONLY")
+    try:
+        os.environ["GEX_RAW_ONLY"] = "1"
+        assert worker.refresh_catalogue_if_due(None) == 0
+        assert catalogue.refresh_if_due(None, force=True) == 0
+        assert calls == [], calls
+    finally:
+        catalogue.fetch_directory = original
+        if original_env is None:
+            os.environ.pop("GEX_RAW_ONLY", None)
+        else:
+            os.environ["GEX_RAW_ONLY"] = original_env
+    print("raw-only: no symbol-directory request")
+
+
+def check_a_raw_needs_a_readable_stamp_of_today():
+    """Review of fork PR #5: a raw with no readable `timestamp` would store a new
+    moment on every pass (the collector falls back to the wall clock), so it is
+    refused; a body morning-bites wrote (`mb_origin`) stamped on another ET day is
+    refused too."""
+    import tempfile
+
+    from app.providers import cboe
+
+    now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    today = now_utc.astimezone(cboe._ET)
+    with tempfile.TemporaryDirectory() as raw_dir:
+        provider = cboe.CboeProvider(raw_dir=raw_dir, raw_only=True)
+        for ticker, stamp in (("AAPL", None), ("AMD", "not a time"), ("MU", "")):
+            _raw_file(raw_dir, f"{today:%Y-%m-%d}-premarket-{ticker}.json.gz", _raw_body(stamp))
+            try:
+                provider.fetch_ticker_snapshot(ticker)
+            except ValueError as exc:
+                assert str(exc) == "morning-bites raw has no readable timestamp", str(exc)
+            else:
+                raise AssertionError(f"{ticker}: a raw with no readable timestamp must be refused")
+        old = (now_utc - dt.timedelta(days=2)).replace(tzinfo=None)
+        _raw_file(raw_dir, f"{today:%Y-%m-%d}-premarket-NVDA.json.gz", _raw_body(f"{old:%Y-%m-%d %H:%M:%S}"))
+        try:
+            provider.fetch_ticker_snapshot("NVDA")
+        except ValueError as exc:
+            assert "not today" in str(exc), str(exc)
+        else:
+            raise AssertionError("a morning-bites body stamped on another day must be refused")
+        good = now_utc.replace(tzinfo=None)
+        _raw_file(raw_dir, f"{today:%Y-%m-%d}-premarket-TSLA.json.gz", _raw_body(f"{good:%Y-%m-%d %H:%M:%S}"))
+        _, frame = provider.fetch_ticker_snapshot("TSLA")
+        assert frame.attrs["collected_at"] == good
+    print("a raw without a readable stamp of today is refused")
+
+
+def check_a_missing_raw_never_suspends_a_ticker():
+    """Review of fork PR #5: NoRawToday is morning-bites not having written a file,
+    not the symbol being hopeless, so it never counts toward the permanent
+    suspension; any other failure still does."""
+    from app import config
+    from app.providers import cboe
+
+    conn = db.get_connection()
+    who = "NORAWCHK"
+    message = str(cboe.NoRawToday(who))
+    assert db.is_missing_raw(message) and not db.is_missing_raw("no price for X") and not db.is_missing_raw(None)
+    start = dt.datetime(2026, 11, 23, 14, 0)  # a Monday, in session
+    for n in range(config.UNRESOLVABLE_AFTER_FAILURES + 3):
+        at = start + dt.timedelta(minutes=n)
+        db.log_run(conn, at, at + dt.timedelta(seconds=5), who, "failed", message, source="cboe")
+    assert who not in db.unresolvable_tickers(conn)
+    for n in range(config.UNRESOLVABLE_AFTER_FAILURES):
+        at = start + dt.timedelta(hours=1, minutes=n)
+        db.log_run(conn, at, at + dt.timedelta(seconds=5), who, "failed", "no price for NORAWCHK", source="cboe")
+    assert who in db.unresolvable_tickers(conn)
+    conn.execute("DELETE FROM collection_runs WHERE ticker = %s", (who,))
+    conn.commit()
+    conn.close()
+    print("a missing raw never suspends a ticker")
+
+
+def check_the_raw_name_is_matched_exactly():
+    """Review of fork PR #5: the raw file is `<date>-<session>-<ticker>.json.gz`
+    with the session one of three and the ticker literal: `B` is not BRK-B's file,
+    `*` is not everybody's, and an unknown session is not read."""
+    import tempfile
+
+    from app.providers import cboe
+
+    now = dt.datetime.now(cboe._ET)
+    with tempfile.TemporaryDirectory() as raw_dir:
+        for name in ("BRK-B", "AB", "B-X"):
+            _raw_file(raw_dir, f"{now:%Y-%m-%d}-premarket-{name}.json.gz", {})
+        _raw_file(raw_dir, f"{now:%Y-%m-%d}-weird-B.json.gz", {})
+        _raw_file(raw_dir, f"{now:%Y-%m-%d}-pre-close-C.json.gz", {})
+        for ticker in ("B", "*", "?", "[A]", "C", "-B", "../B"):
+            assert cboe.todays_raw(raw_dir, ticker, now, any_ticker=True) is None, ticker
+        for session in ("premarket", "close", "intraday"):
+            _raw_file(raw_dir, f"{now:%Y-%m-%d}-{session}-B.json.gz", {})
+            got = cboe.todays_raw(raw_dir, "B", now, any_ticker=True)
+            assert got is not None and got.name == f"{now:%Y-%m-%d}-{session}-B.json.gz", (session, got)
+            os.remove(got)
+        assert cboe.todays_raw(raw_dir, "BRK-B", now, any_ticker=True).name.endswith("-premarket-BRK-B.json.gz")
+    print("the raw name is matched exactly")
 
 
 def check_the_collector_stores_a_source_moment_once():
@@ -2987,6 +3115,10 @@ def main():
     check_the_collector_stores_a_source_moment_once()
     check_raw_only_reads_every_ticker_and_never_requests()
     check_the_morning_bites_schwab_fixture_parses()
+    check_raw_only_requests_no_symbol_directory()
+    check_a_raw_needs_a_readable_stamp_of_today()
+    check_a_missing_raw_never_suspends_a_ticker()
+    check_the_raw_name_is_matched_exactly()
     check_a_grazing_crossing_is_not_a_flip()
     check_a_far_flip_is_no_flip()
     check_gamma_flip_by_depth_is_each_crop()

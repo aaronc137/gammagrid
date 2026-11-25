@@ -74,6 +74,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -180,6 +181,11 @@ class NoRawToday(Exception):
         super().__init__(f"No morning-bites raw for {ticker.upper()} today (no request).")
 
 
+# The raw file's name parts (morning-bites' gex-raw-export.sh writes exactly these).
+RAW_SESSIONS = ("premarket", "intraday", "close")
+_RAW_TICKER = re.compile(r"[A-Z][A-Z0-9.-]{0,9}")
+
+
 def raw_only_from_env() -> bool:
     """`GEX_RAW_ONLY` is on only when it is exactly `1`."""
     return os.environ.get("GEX_RAW_ONLY") == "1"
@@ -193,10 +199,15 @@ def todays_raw(raw_dir: str | os.PathLike | None, ticker: str, now: dt.datetime 
     not count — the window is only ever bounded above."""
     if not raw_dir or (not any_ticker and ticker.upper() not in SHARED_TICKERS):
         return None
+    # the name is exact: a ticker outside the grammar is no file at all (`../X`,
+    # `*`), and a literal one never matches another's (`B` is not BRK-B's)
+    if not _RAW_TICKER.fullmatch(ticker.upper()):
+        return None
     now = now or dt.datetime.now(_ET)
+    names = [f"{now:%Y-%m-%d}-{session}-{url_ticker(ticker)}.json.gz" for session in RAW_SESSIONS]
     candidates = [
-        path for path in Path(raw_dir).glob(f"{now:%Y-%m-%d}-*-{url_ticker(ticker)}.json.gz")
-        if path.stat().st_mtime <= now.timestamp()
+        path for path in (Path(raw_dir) / name for name in names)
+        if path.is_file() and path.stat().st_mtime <= now.timestamp()
     ]
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
@@ -265,6 +276,18 @@ class CboeProvider:
             payload = _get(ticker)
         spot, frame = chain_from_payload(payload, now.date())
         if from_raw:
+            stamp = quote_time(payload)
+            if stamp is None:
+                # the collector would fall back to the wall clock and store the same
+                # chain again on every pass
+                raise ValueError("morning-bites raw has no readable timestamp")
+            if (payload.get("mb_origin") or {}).get("source"):
+                # a body morning-bites wrote is stamped with its read: today's or stale
+                # (Cboe's own stamp on SPX/SPY/QQQ is its last quote, which may not be today)
+                stamp_day = stamp.replace(tzinfo=dt.timezone.utc).astimezone(_ET).date()
+                if stamp_day != now.date():
+                    raise ValueError(
+                        f"morning-bites raw is stamped {stamp:%Y-%m-%d %H:%M:%S} UTC, not today ({now:%Y-%m-%d} ET)")
             # The raw's own moment, for the collector (see the module docstring). Only
             # for the raw path: on a GET the wall clock stays the moment, because
             # Cboe's stamp is the last quote and sits still for days on a thin name
